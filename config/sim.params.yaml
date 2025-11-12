@@ -7,9 +7,9 @@ dummy_pgv_sim:
     holonomic_sim: true
 
     # 초기 자세: yaw 15도로 틀어 시작(정렬 테스트 확인)
-    init_x: 0.2
+    init_x: 0.0
     init_y: 0.0
-    init_yaw_deg: 15.0
+    init_yaw_deg: 35.0
 
     # 센서 오프셋/노이즈 (필요시 조정)
     sensor_x_offset: 0.0

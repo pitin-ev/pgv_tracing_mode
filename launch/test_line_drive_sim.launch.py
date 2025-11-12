@@ -15,7 +15,6 @@ def generate_launch_description():
         DeclareLaunchArgument('namespace', default_value=''),
         DeclareLaunchArgument('controller_params', default_value=default_ctrl_params),
         DeclareLaunchArgument('sim_params', default_value=default_sim_params),
-        DeclareLaunchArgument('holonomic', default_value='true'),
         DeclareLaunchArgument('use_relative', default_value='true'),
         DeclareLaunchArgument('relative_goal', default_value='1.5'),
         DeclareLaunchArgument('absolute_goal', default_value='5.0'),
@@ -41,7 +40,6 @@ def generate_launch_description():
             output='screen',
             parameters=[
                 LaunchConfiguration('controller_params'),
-                {'holonomic': LaunchConfiguration('holonomic')}
             ],
         ),
 
