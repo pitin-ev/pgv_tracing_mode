@@ -1,3 +1,91 @@
+"""라인 트레이싱 / 정렬 ROS2 노드 (LineDriveNode).
+
+이 노드는 PGV 등에서 발행하는 `geometry_msgs/PoseStamped` 센서 포즈를 이용하여
+로봇을 추상적인 "라인 좌표계" 상에서 주행하거나 정렬합니다.
+
+주요 기능:
+    * 라인 방향으로의 요(yaw) 정렬 (Phase.ALIGN_YAW)
+    * 요 정렬 후 짧은 마이크로 전진(SLOW_START)으로 부드러운 시작
+    * 절대 또는 상대 X 목표 주행 + Y=0 유지 (Phase.RUNNING)
+    * 홀로노믹 전용 Y축 정렬 서비스 (ALIGN_Y_ONLY) - 전진 없이 횡방향 보정
+    * Bool 토픽을 이용한 수동 hold-to-run 방식 전/후진 오버라이드
+    * Pose 업데이트 타임아웃 시 안전 정지
+
+상태 머신 (Phase):
+    IDLE         : 대기 상태 (정지), 목표나 정렬 요청 없음
+    ALIGN_YAW    : 요 오차를 기준 임계값 이하로 줄이기 위한 제자리 회전
+    SLOW_START   : 짧은 시간 저속 전진으로 기계적/센서적 워밍업
+    RUNNING      : 목표 X로 이동하면서 Y, Yaw 안정화
+    DONE         : 목표 또는 정렬 완료 후 정지
+    ALIGN_Y_ONLY : 홀로노믹 전용 Y축 정렬 (Yaw 보정 히스테리시스 포함)
+
+서비스:
+    /line_drive/align_to_line    (Trigger): 일반 요 정렬 시작 (ALIGN_YAW → SLOW_START → RUNNING)
+    /line_drive/nudge_forward    (Trigger): 즉시 SLOW_START 수행 (마이크로 전진)
+    /line_drive/align_y_only     (Trigger): 필요 시 요 정렬 후 Y축 정렬 (ALIGN_YAW → ALIGN_Y_ONLY)
+
+토픽:
+    pose_topic (PoseStamped)           : 센서 포즈 (라인 프레임)
+    /line_drive/relative_x_goal (Float64): 현재 x 기준 상대 이동 목표 (Δx)
+    /line_drive/absolute_x_goal (Float64): 절대 x 목표
+    /line_drive/go_forward (Bool)        : 수동 전진 hold 신호 (TRUE 펄스 유지)
+    /line_drive/go_backward (Bool)       : 수동 후진 hold 신호
+    cmd_topic (Twist)                    : 속도 명령 (vx, vy, wz)
+
+수동 hold-to-run 로직:
+    TRUE 메시지 수신 시 타임스탬프 저장. `manual_timeout` 초 이내면 활성 유지.
+    전진/후진 둘 다 활성 시 안전을 위해 0 (정지) 처리.
+    수동 입력은 각 제어 주기에서 자동 목표보다 우선.
+
+주요 파라미터 (모두 __init__에서 declare):
+    pose_topic (str)                : 입력 포즈 토픽
+    cmd_topic (str)                 : 출력 Twist 토픽
+    holonomic (bool)                : True면 vx, vy 사용; False면 v, w 사용
+    yaw_align_threshold_deg (float) : ALIGN_YAW 완료 기준 (deg)
+    tolerance_yaw_deg (float)       : 안정 yaw 판정 허용 오차 (deg)
+    yaw_hysteresis_factor (float)   : ALIGN_Y_ONLY에서 yaw 보정 활성 임계 다중값
+    tolerance_xy (float, m)         : x,y 목표/정렬 완료 허용 오차
+    pose_timeout_sec (float)        : pose 미수신 안전 정지 시간
+    control_rate (Hz)               : 제어 루프 주파수
+    max_lin_vel, max_ang_vel        : 최대 선속도 / 각속도
+    accel_lin, accel_ang            : 제어 주기당 가속(슬루) 제한
+    slow_start_duration (s)         : SLOW_START 지속 시간
+    slow_start_speed (m/s)          : SLOW_START 속도
+    teleop_speed (m/s)              : 수동 전/후진 기본 속도
+    manual_timeout (s)              : hold-to-run TRUE 유지 시간
+    sensor_* offsets                : 센서 포즈 보정 오프셋 및 yaw 오프셋
+    kp_x, kp_y, kp_yaw              : 단순 P 게인
+
+Yaw 히스테리시스 (ALIGN_Y_ONLY):
+    |yaw_err| > tol_yaw * yaw_hysteresis_factor 일 때 보정 활성
+    |yaw_err| <= tol_yaw 일 때 비활성
+    매우 작은 w_cmd (<0.02 rad/s) 데드밴드로 지터 억제
+
+완료 조건:
+    RUNNING 목표: |x_err| <= tol_xy AND |y| <= tol_xy
+    Y 정렬: |y| <= tol_xy AND yaw 안정(보정 비활성 & |yaw_err| <= tol_yaw)
+
+사용 예시:
+    기본 실행:
+        ros2 launch pgv_tracing_mode line_drive.launch.py
+    파라미터 오버라이드:
+        ros2 run pgv_tracing_mode line_drive --ros-args -p holonomic:=true -p yaw_hysteresis_factor:=2.0
+    상대 목표 설정:
+        ros2 topic pub /line_drive/relative_x_goal std_msgs/Float64 "data: 0.5"
+    Y 정렬 서비스 호출:
+        ros2 service call /line_drive/align_y_only std_srvs/srv/Trigger {}
+    수동 전진 펄스:
+        ros2 topic pub /line_drive/go_forward std_msgs/Bool "data: true"
+
+향후 개선 아이디어 (미구현):
+    * Y / Yaw 안정성 시간 기반 카운트 후 완료 처리
+    * Yaw 에러 EMA 필터로 각속도 부드럽게
+    * 남은 거리/속도 기반 적응형 게인
+
+본 파일은 가독성을 위해 많은 주석이 포함되어 있으며,
+상태 전이 로직을 변경할 때는 문서화된 흐름을 유지하는 것이 좋습니다.
+"""
+
 import math
 import time
 from enum import Enum
@@ -13,7 +101,10 @@ from std_srvs.srv import Trigger
 
 
 def ang_norm(a):
-    """wrap to [-pi, pi]"""
+    """각도를 [-pi, pi] 범위로 정규화.
+
+    모듈로 연산을 사용하여 어떤 실수 입력에도 안정적으로 동작합니다.
+    """
     a = (a + math.pi) % (2.0 * math.pi) - math.pi
     return a
 
@@ -31,13 +122,16 @@ class LineDriveNode(Node):
     def __init__(self):
         super().__init__('line_drive')
 
-        # ---------------- Parameters ----------------
+    # ---------------- 파라미터 선언 ----------------
+    # (상단 모듈 주석에 상세 설명 있음)
         self.declare_parameter('pose_topic', '/amr1/bcd_pose')
         self.declare_parameter('cmd_topic', '/cmd_vel')
 
         self.declare_parameter('holonomic', True)  # True: vx,vy only (w=0 after align). False: v,w only
         self.declare_parameter('yaw_align_threshold_deg', 2.0)
         self.declare_parameter('tolerance_yaw_deg', 2.0)
+        # Hysteresis factor for yaw correction in ALIGN_Y_ONLY (start > tol*factor, stop < tol)
+        self.declare_parameter('yaw_hysteresis_factor', 1.5)
         self.declare_parameter('tolerance_xy', 0.01)  # [m]
         self.declare_parameter('pose_timeout_sec', 0.2)  # 200ms 동안 pose 안 들어오면 stop
 
@@ -65,14 +159,16 @@ class LineDriveNode(Node):
         self.declare_parameter('kp_y', 1.0)
         self.declare_parameter('kp_yaw', 2.0)
 
-        # Fetch
+    # ---------------- 파라미터 값 조회 ----------------
         self.pose_topic = self.get_parameter('pose_topic').value
         self.cmd_topic = self.get_parameter('cmd_topic').value
         self.holonomic = bool(self.get_parameter('holonomic').value)
 
 
+    # deg → rad 변환
         self.yaw_align_threshold = math.radians(float(self.get_parameter('yaw_align_threshold_deg').value))
         self.tol_yaw = math.radians(float(self.get_parameter('tolerance_yaw_deg').value))
+        self.yaw_hysteresis_factor = float(self.get_parameter('yaw_hysteresis_factor').value)
         self.tol_xy = float(self.get_parameter('tolerance_xy').value)
         self.pose_timeout = float(self.get_parameter('pose_timeout_sec').value)
 
@@ -97,11 +193,11 @@ class LineDriveNode(Node):
         self.kp_y = float(self.get_parameter('kp_y').value)
         self.kp_yaw = float(self.get_parameter('kp_yaw').value)
 
-        # QoS: R4 노드가 best-effort일 수도 있어 파라미터 변경을 고려할 수 있게 최소값으로 설정
+    # QoS: 고속/간헐 손실 허용 센서 대비 BEST_EFFORT + 작은 depth
         qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                          history=HistoryPolicy.KEEP_LAST, depth=5)
 
-        # ---------------- I/O ----------------
+    # ---------------- I/O (토픽/서비스) ----------------
         self.pose_sub = self.create_subscription(PoseStamped, self.pose_topic, self._on_pose, qos)
         self.rel_goal_sub = self.create_subscription(Float64, '/line_drive/relative_x_goal', self._on_rel_goal, 10)
         self.abs_goal_sub = self.create_subscription(Float64, '/line_drive/absolute_x_goal', self._on_abs_goal, 10)
@@ -115,17 +211,17 @@ class LineDriveNode(Node):
         self.fwd_sub = self.create_subscription(Bool, '/line_drive/go_forward', self._on_go_forward, 10)
         self.back_sub = self.create_subscription(Bool, '/line_drive/go_backward', self._on_go_backward, 10)
 
-        # ---------------- State ----------------
+    # ---------------- 상태 변수 ----------------
         self.phase = Phase.IDLE
         self.last_twist = Twist()
         self.last_pose_time = self.get_clock().now()
 
-        # PGV pose (line frame): assume pose of sensor in line frame
+    # PGV 센서 포즈 (오프셋 적용 후)
         self.x = 0.0
         self.y = 0.0
         self.yaw = 0.0  # radians, angle around +z, yaw=0 is aligned with line +x
 
-        # goals
+    # 목표 관리: 절대 x 또는 상대 Δx (start_x_for_rel 기준)
         self.goal_active = False
         self.goal_abs_x = None  # absolute x target (in line frame)
         self.goal_rel_dx = None # relative x target (delta)
@@ -133,14 +229,16 @@ class LineDriveNode(Node):
         self.start_x_for_rel = None
         self.slow_start_until = None
 
-        # Manual flags (timestamps of last TRUE)
+    # 수동 hold-to-run 타임스탬프 (None이면 비활성)
         self.last_fwd_true = None
         self.last_back_true = None
 
-        # y-align 요청 플래그
+    # Y 정렬 서비스 요청 플래그 (완료 시 해제)
         self.y_align_requested = False
+        # Internal flag for yaw correction hysteresis in ALIGN_Y_ONLY
+        self.yaw_correction_active = False
 
-        # Timers
+    # 타이머: 주기적 제어 루프 실행
         period = 1.0 / self.rate_hz
         self.timer = self.create_timer(period, self._control_loop)
 
@@ -148,8 +246,8 @@ class LineDriveNode(Node):
 
     # ---------------- Subscribers ----------------
     def _on_pose(self, msg: PoseStamped):
-        # Extract x,y,yaw from PoseStamped (sensor frame in line frame)
-        # Convert builtin_interfaces.msg.Time -> rclpy Time for arithmetic compatibility
+        # PoseStamped에서 x,y,yaw 추출
+        # builtin_interfaces.msg.Time → rclpy Time 변환 (시간 연산 가능하도록)
         self.last_pose_time = rclpy.time.Time.from_msg(msg.header.stamp)
         self.x = msg.pose.position.x + self.sensor_x_offset
         self.y = msg.pose.position.y + self.sensor_y_offset
@@ -161,9 +259,11 @@ class LineDriveNode(Node):
         cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
         yaw = math.atan2(siny_cosp, cosy_cosp)
 
+        # 센서 yaw 오프셋 적용 후 정규화된 yaw 저장
         self.yaw = ang_norm(yaw + self.sensor_yaw_offset)
 
     def _on_rel_goal(self, msg: Float64):
+        """상대 x 목표 처리: 현재 x를 기준으로 Δx 설정 후 목표 활성화."""
         self.goal_rel_dx = float(msg.data)
         self.goal_abs_x = None
         self.start_x_for_rel = self.x
@@ -174,6 +274,7 @@ class LineDriveNode(Node):
         self.get_logger().info(f"[goal] target x*={self.start_x_for_rel + self.goal_rel_dx:.3f} m")
 
     def _on_abs_goal(self, msg: Float64):
+        """절대 x 목표 처리: 절대 x 설정 후 목표 활성화."""
         self.goal_abs_x = float(msg.data)
         self.goal_rel_dx = None
         self.start_x_for_rel = None
@@ -183,17 +284,20 @@ class LineDriveNode(Node):
 
     # manual Bool callbacks
     def _on_go_forward(self, msg: Bool):
+        """전진 TRUE 펄스 수신 시 타임스탬프 갱신."""
         self.get_logger().info(f"Received go_forward: {msg.data}")
         if msg.data:
             self.last_fwd_true = self.get_clock().now()
 
     def _on_go_backward(self, msg: Bool):
+        """후진 TRUE 펄스 수신 시 타임스탬프 갱신."""
         self.get_logger().info(f"Received go_backward: {msg.data}")
         if msg.data:
             self.last_back_true = self.get_clock().now()
 
     # ---------------- Services ----------------
     def _srv_align(self, req, resp):
+        """서비스: 일반 yaw 정렬 시작."""
         self._enter_align_phase()
         resp.success = True
         resp.message = "Align-to-line initiated"
@@ -209,6 +313,7 @@ class LineDriveNode(Node):
     
     # holonomic 전용 y축 정렬 서비스
     def _srv_align_y_only(self, req, resp):
+        """서비스: Y축 정렬 (필요 시 먼저 yaw 정렬)."""
         if not self.holonomic:
             resp.success = False
             resp.message = "align_y_only is supported only in holonomic mode."
@@ -234,29 +339,37 @@ class LineDriveNode(Node):
 
     # ---------------- Phase helpers ----------------
     def _enter_align_phase(self):
+        """ALIGN_YAW 단계로 전이."""
         self.phase = Phase.ALIGN_YAW
         self.slow_start_until = None
 
     def _enter_align_y_only(self):
+        """ALIGN_Y_ONLY 단계로 전이; yaw 히스테리시스 상태 초기화."""
         self.phase = Phase.ALIGN_Y_ONLY
+        # initialize yaw correction state based on current yaw error
+        yaw_err = abs(ang_norm(0.0 - self.yaw))
+        self.yaw_correction_active = yaw_err > self.tol_yaw
         self.get_logger().info("[align_y_only] started")
 
     def _enter_slow_start(self):
+        """SLOW_START (마이크로 전진) 단계로 전이."""
         self.phase = Phase.SLOW_START
         self.slow_start_until = self.get_clock().now() + Duration(seconds=self.slow_start_duration)
 
     def _enter_running(self):
+        """RUNNING (목표 추종) 단계로 전이."""
         self.phase = Phase.RUNNING
 
     def _enter_done(self):
+        """DONE 단계: 0 속도 명령 발행 및 목표 비활성화."""
         self.phase = Phase.DONE
         self.goal_active = False
         self._publish_twist(0.0, 0.0, 0.0)
 
     # ---------------- Manual helpers ----------------
     def _manual_active(self):
-        """Return +1 if forward active, -1 if backward active, 0 otherwise.
-           TRUE가 0.1s 내에 들어온 쪽만 활성. 둘 다 있으면 0(안전 정지)."""
+        """전진 활성 시 +1, 후진 활성 시 -1, 둘 다/없으면 0 반환.
+        TRUE 펄스가 manual_timeout 이내에 들어온 방향만 유지, 둘 다면 안전 정지(0)."""
         now = self.get_clock().now()
         tol = Duration(seconds=self.manual_timeout)
 
@@ -272,7 +385,7 @@ class LineDriveNode(Node):
         return 0
 
     def _do_manual(self, direction: int):
-        """direction: +1 forward, -1 backward"""
+        """수동 제어 실행: direction +1 전진 / -1 후진."""
         # 목표 주행은 일시 중지
         # (원한다면 여기서 self.goal_active를 False로 만들어도 됨)
         speed = self.teleop_speed * (1.0 if direction > 0 else -1.0)
@@ -314,6 +427,11 @@ class LineDriveNode(Node):
 
     # ---------------- Control loop ----------------
     def _control_loop(self):
+        """주기적 제어 루프 (우선순위 순서):
+        1) 안전 타임아웃 검사
+        2) 수동 hold-to-run 처리
+        3) 상태(Phase)별 자동 동작
+        """
         now = self.get_clock().now()
         if (now - self.last_pose_time) > Duration(seconds=self.pose_timeout):
             if (self.last_twist.linear.x != 0.0) or (self.last_twist.linear.y != 0.0) or (self.last_twist.angular.z != 0.0):
@@ -356,6 +474,10 @@ class LineDriveNode(Node):
 
     # ---------------- Behaviors ----------------
     def _do_align_yaw(self):
+        """Yaw 정렬: P 제어로 임계값 이하까지 회전.
+
+        y-only 정렬 요청이면 ALIGN_Y_ONLY로, 아니면 SLOW_START로 분기.
+        """
         yaw_err = ang_norm(0.0 - self.yaw)
         # P controller on yaw
         w_cmd = self.kp_yaw * yaw_err
@@ -365,22 +487,43 @@ class LineDriveNode(Node):
         self._publish_twist(0.0, 0.0, w_cmd)
 
         if abs(yaw_err) <= self.yaw_align_threshold:
-            # Done: enter slow start micro +x
-            self._enter_slow_start()
-            self.get_logger().info("[align] yaw aligned; entering slow-start")
+            # 완료 시 분기: y-align 요청이 있으면 ALIGN_Y_ONLY로, 아니면 기존 slow-start
+            if self.y_align_requested:
+                self._enter_align_y_only()
+                self.get_logger().info("[align] yaw aligned; entering ALIGN_Y_ONLY")
+            else:
+                self._enter_slow_start()
+                self.get_logger().info("[align] yaw aligned; entering slow-start")
 
     def _do_align_y_only(self):
+        """홀로노믹 Y축 정렬 (yaw 히스테리시스 포함).
+
+        vy로 y 보정, 히스테리시스 활성 시에만 w_cmd 최소 적용.
+        완료: y 허용오차 & yaw 안정.
+        """
         # holonomic만 허용 (안전 guard)
         if not self.holonomic:
             self.get_logger().warn("[align_y_only] called in non-holonomic; stopping.")
             self._enter_done()
             return
 
-        # yaw 드리프트가 커지면 미세 보정 허용
-        yaw_err = ang_norm(0.0 - self.yaw)
+        # yaw 드리프트가 커지면 미세 보정 허용 (hysteresis 적용)
+        yaw_err_raw = ang_norm(0.0 - self.yaw)
+        yaw_abs = abs(yaw_err_raw)
+        # Activate correction only if beyond outer band
+        if not self.yaw_correction_active and yaw_abs > (self.tol_yaw * self.yaw_hysteresis_factor):
+            self.yaw_correction_active = True
+        # Deactivate when within inner tolerance
+        if self.yaw_correction_active and yaw_abs <= self.tol_yaw:
+            self.yaw_correction_active = False
+
         w_cmd = 0.0
-        if abs(yaw_err) > self.tol_yaw:
-            w_cmd = max(-0.2, min(0.2, self.kp_yaw * yaw_err))
+        if self.yaw_correction_active:
+            w_cmd_raw = self.kp_yaw * yaw_err_raw
+            # small deadband to avoid jitter
+            if abs(w_cmd_raw) < 0.02:
+                w_cmd_raw = 0.0
+            w_cmd = max(-0.2, min(0.2, w_cmd_raw))
 
         # vy만 사용해서 y를 0으로 수렴 (vx=0)
         y_err = -self.y
@@ -393,13 +536,14 @@ class LineDriveNode(Node):
 
         self._publish_twist(vx_cmd, vy_cmd, w_cmd)
 
-        # 완료 판정
-        if abs(self.y) <= self.tol_xy:
+        # 완료 판정: y 정렬 AND yaw within tolerance (안정 상태)
+        if abs(self.y) <= self.tol_xy and (not self.yaw_correction_active) and yaw_abs <= self.tol_yaw:
             self.y_align_requested = False
             self._enter_done()
-            self.get_logger().info("[align_y_only] done; y≈0 reached")
+            self.get_logger().info("[align_y_only] done; y≈0 & yaw stable")
 
     def _do_slow_start(self):
+        """Yaw 정렬 직후 짧은 저속 전진으로 부드러운 시작."""
         now = self.get_clock().now()
         if self.slow_start_until is None:
             self.slow_start_until = now + Duration(seconds=self.slow_start_duration)
@@ -415,6 +559,7 @@ class LineDriveNode(Node):
             self.get_logger().info("[slow-start] complete; entering RUNNING")
 
     def _do_running(self):
+        """RUNNING: x 목표로 이동하며 y, yaw 안정화."""
         # Compute target x*
         if self.goal_abs_x is not None:
             x_target = self.goal_abs_x
@@ -475,6 +620,7 @@ class LineDriveNode(Node):
 
     # ---------------- Utils ----------------
     def _publish_twist(self, vx, vy, wz):
+        """Twist 발행 및 마지막 명령 저장 (slew 제한에 사용)."""
         t = Twist()
         t.linear.x = float(vx)
         t.linear.y = float(vy)
@@ -484,7 +630,7 @@ class LineDriveNode(Node):
 
     @staticmethod
     def _slew_limit(target, current, step):
-        """limit change per cycle (simple slew rate limiter)"""
+        """한 주기당 변화량 제한 (간단한 slew rate 제한)."""
         delta = target - current
         if delta > step:
             return current + step

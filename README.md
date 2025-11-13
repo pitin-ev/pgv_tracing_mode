@@ -1,26 +1,41 @@
-# [PI_amr_v2_navigation]
+# pgv_tracing_mode (라인 트레이싱 / 정렬 패키지)
 
-**PI_amr_v2_navigation** is the top-level integrated repository (super-repo) for the **PI AMR v2 autonomous mobile robot project**.  
-This repository includes a modular navigation and control stack built on ROS 2 Humble, designed for line-following and precision docking using PGV (R4) sensors.
-
----
-
-## 🧭 Overview
-
-이 저장소는 **PGV(R4) 라인 센서 데이터를 기반으로 주행 제어를 수행하는 ROS 2 패키지**입니다.  
-`line_drive_controller` 패키지는 센서에서 제공하는 PoseStamped(x, y, yaw) 값을 이용해  
-홀로노믹(holonomic) 및 비홀로노믹(non-holonomic) 모드 모두에서 주행 제어를 수행합니다.
-
-- 센서가 라인 중앙에 위치하도록 제어함으로써 라인 추종 및 정렬이 가능  
-- 센서 위치 기준 제어를 기본으로 하며, 별도의 오프셋 보정 없이도 안정적 동작  
-- YAML 파라미터 파일 기반 설정 및 launch 통합 지원  
-- Dummy PGV 시뮬레이터 포함 → 실제 하드웨어 없이 폐루프 테스트 가능
-
-본 연구는 **PITIN EV “PI AMR V2 자율주행 로봇 프로젝트”**의 일부로 수행되었습니다.
+`pgv_tracing_mode` 는 PGV(R4 등) 라인 센서가 퍼블리시하는 `PoseStamped (x,y,yaw)` 데이터를 이용하여
+로봇을 라인 위에서 정렬 / 주행 / 미세 위치 보정하는 ROS 2 (Humble) Python 패키지입니다.
+홀로노믹(측면 이동 가능)과 비홀로노믹(차동/조향) 플랫폼을 모두 지원하며, 서비스·토픽 기반의 간단한 인터페이스로
+상대/절대 이동, yaw 정렬, Y축 단독 정렬, 수동 hold-to-run 제어를 제공합니다.
 
 ---
 
-## ⚙️ Dependencies
+## 🧭 개요 (Overview)
+
+주요 특징:
+* Yaw 정렬 (ALIGN_YAW) + 선택적 Slow Start 전진
+* 절대/상대 X 목표 추종 (RUNNING) 과 Y=0 유지
+* 홀로노믹 전용 Y축 정렬 (ALIGN_Y_ONLY) + Yaw 히스테리시스 (미세 도리도리 억제)
+* Hold-to-run 수동 전/후진 명령 (다른 목표보다 우선)
+* Pose 입력 타임아웃 안전 정지
+* Slew rate(가속) 제한 + 속도/각속도 클램프
+* YAML 파라미터 / launch 파일 제공
+* Dummy PGV 시뮬레이터(`sim_dummy_pgv.py`) 포함 → 실제 센서 없이 폐루프 테스트 가능
+
+상태(Phase) 요약:
+| Phase | 설명 |
+|-------|------|
+| IDLE | 목표/정렬 요청 없음 (정지) |
+| ALIGN_YAW | yaw 오차를 임계값 이하로 회전 보정 |
+| SLOW_START | 짧은 저속 전진 (기계/센서 워밍업) |
+| RUNNING | X 목표 추종 + Y, yaw 안정화 |
+| ALIGN_Y_ONLY | 홀로노믹 Y축 정렬 (yaw 히스테리시스 적용) |
+| DONE | 완료 후 정지 유지 |
+
+히스테리시스:
+* |yaw_err| > tol_yaw * yaw_hysteresis_factor → yaw 보정 활성
+* |yaw_err| <= tol_yaw → 보정 비활성 + 작은 deadband 로 미세 진동 억제
+
+---
+
+## ⚙️ 의존성 (Dependencies)
 
 - **ROS 2 Humble** (>= 2022.05)
 - **Python 3.10**
@@ -30,81 +45,91 @@ This repository includes a modular navigation and control stack built on ROS 2 H
 
 ---
 
-## 🧩 Packages included
+## 🧩 포함된 구성 요소
 
-| Package | Description |
-|----------|--------------|
-| **line_drive_controller** | PGV PoseStamped 입력을 기반으로 라인 주행 제어를 수행 (홀로/비홀로 선택 가능). |
-| **dummy_pgv_sim** | `/cmd_vel`을 적분하여 가상의 PGV PoseStamped 데이터를 퍼블리시하는 더미 시뮬레이터. |
-| **one_shot_goal** | 테스트용 단일 주행 목표 명령 노드 (relative / absolute / align service call). |
+| 파일 / 노드 | 설명 |
+|-------------|------|
+| `pgv_tracing_mode/line_tracing_node.py` | 핵심 제어 노드 (LineDriveNode) |
+| `pgv_tracing_mode/sim_dummy_pgv.py` | `/cmd_vel` 적분 후 PGV PoseStamped 더미 발행 |
+| `pgv_tracing_mode/one_shot_goal.py` | 테스트용 단발 목표(상대/절대) 및 서비스 호출 예제 |
+| `launch/line_drive.launch.py` | 기본 제어 노드 런치 |
+| `launch/test_line_drive_sim.launch.py` | 더미 + 제어 + 목표 통합 테스트 런치 |
+| `config/line_drive.params.yaml` | 제어 파라미터 |
+| `config/sim.params.yaml` | 시뮬레이터 파라미터 |
 
 ---
 
-## 🛠️ Installation
+## 🛠️ 설치 (Installation)
 
 ```bash
-# 워크스페이스 생성 및 clone
-mkdir -p ~/amr_ws/src && cd ~/amr_ws/src
-git clone --recurse-submodules https://github.com/pitin-ev/PI_amr_v2_navigation.git
+# 워크스페이스 생성 및 현재 패키지 clone (예시)
+mkdir -p ~/pgv_ws/src && cd ~/pgv_ws/src
+git clone https://github.com/<your-org-or-user>/pgv_tracing_mode.git
 
-# (만약 --recurse-submodules 없이 clone 했다면)
-git submodule update --init --recursive
-
-# 의존성 설치
-cd ~/amr_ws
+cd ~/pgv_ws
 rosdep update
 rosdep install --from-paths src --ignore-src -r -y
 
-# 빌드
 colcon build --symlink-install
 source install/setup.bash
-````
+```
 
 ---
 
-## 🚀 Usage
+## 🚀 사용법 (Usage)
 
 ### ▶ 기본 실행 (YAML 파라미터 기반)
 
 ```bash
-ros2 launch line_drive_controller line_drive.launch.py
+ros2 launch pgv_tracing_mode line_drive.launch.py
 ```
 
 ### ▶ 통합 시뮬레이션 (Dummy PGV + Controller + Goal)
 
 ```bash
-ros2 launch line_drive_controller test_line_drive_sim.launch.py
+ros2 launch pgv_tracing_mode test_line_drive_sim.launch.py
 ```
 
 ### ▶ 주요 Launch Arguments
 
-| Name               | Default                         | Description                                     |
-| ------------------ | ------------------------------- | ----------------------------------------------- |
-| `holonomic`        | `true`                          | 제어 모드 선택 (true=holonomic / false=non-holonomic) |
-| `params_file`      | `config/line_drive.params.yaml` | 컨트롤러 파라미터 파일                                    |
-| `sim_params`       | `config/sim.params.yaml`        | 시뮬레이터 파라미터 파일                                   |
-| `use_relative`     | `true`                          | 목표 타입 선택 (true=상대 거리, false=절대 좌표)              |
-| `relative_goal`    | `1.5`                           | [m] 상대 이동 거리                                    |
-| `absolute_goal`    | `5.0`                           | [m] 절대 목표 x좌표                                   |
-| `goal_delay_sec`   | `1.0`                           | [s] 목표 발행 전 대기 시간                               |
-| `call_align_first` | `true`                          | 시작 시 yaw 정렬 서비스 먼저 호출 여부                        |
+| 이름                | 기본값                             | 설명 |
+|--------------------|----------------------------------|------|
+| `holonomic`        | `true`                           | true=홀로노믹, false=비홀로노믹 |
+| `params_file`      | `config/line_drive.params.yaml`  | 제어 파라미터 YAML |
+| `sim_params`       | `config/sim.params.yaml`         | 시뮬레이터 파라미터 YAML |
+| `use_relative`     | `true`                           | 상대(Δx) 목표 사용 여부 |
+| `relative_goal`    | `1.5`                            | 상대 이동 거리 (m) |
+| `absolute_goal`    | `5.0`                            | 절대 목표 x (m) |
+| `goal_delay_sec`   | `1.0`                            | 목표 발행 전 지연 (s) |
+| `call_align_first` | `true`                           | 시작 시 yaw 정렬 먼저 수행 |
 
 ---
 
-## 📦 Parameter Highlights
+## 📦 주요 파라미터 (Parameters)
 
-모든 파라미터는 `config/line_drive.params.yaml`에서 설정합니다.
+`config/line_drive.params.yaml` 참고. (일부만 발췌)
 
-| Parameter                                 | Unit         | Description                                    |
-| ----------------------------------------- | ------------ | ---------------------------------------------- |
-| `holonomic`                               | bool         | 제어 모드 선택 (`true`: vx,vy만 사용, `false`: v,ω만 사용) |
-| `yaw_align_threshold_deg`                 | deg          | 초기 yaw 정렬 완료 허용 오차                             |
-| `tolerance_xy`                            | m            | 목표 도달 허용 거리                                    |
-| `control_rate`                            | Hz           | 제어 루프 주기                                       |
-| `max_lin_vel`, `max_ang_vel`              | m/s, rad/s   | 선형/각속도 상한                                      |
-| `accel_lin`, `accel_ang`                  | m/s², rad/s² | 속도 변화 제한(부드러운 가속/감속)                           |
-| `slow_start_duration`, `slow_start_speed` | s, m/s       | 정렬 후 미세 전진(방향성 확인용)                            |
-| `sensor_*_offset`                         | m, deg       | 센서 오프셋(기본 0: 센서 중심 기준 제어)                      |
+| 파라미터 | 단위 | 설명 |
+|----------|------|------|
+| `pose_topic` | str | PGV PoseStamped 입력 토픽 |
+| `cmd_topic` | str | Twist 출력 토픽 |
+| `holonomic` | bool | 제어 모드 (홀로/비홀로) |
+| `yaw_align_threshold_deg` | deg | ALIGN_YAW 종료 기준 |
+| `tolerance_yaw_deg` | deg | 안정 yaw 허용 오차 |
+| `yaw_hysteresis_factor` | - | Y-only yaw 히스테리시스 외측 배수 |
+| `tolerance_xy` | m | 목표/정렬 X,Y 허용 오차 |
+| `pose_timeout_sec` | s | Pose 수신 타임아웃 (안전 정지) |
+| `control_rate` | Hz | 제어 루프 주파수 |
+| `max_lin_vel` / `max_ang_vel` | m/s, rad/s | 속도 상한 |
+| `accel_lin` / `accel_ang` | m/s², rad/s² | Slew (가속) 제한 |
+| `slow_start_duration` / `slow_start_speed` | s, m/s | Slow start 설정 |
+| `teleop_speed` | m/s | 수동 hold-to-run 속도 |
+| `manual_timeout` | s | 수동 TRUE 유지 시간 |
+| `sensor_x_offset` / `sensor_y_offset` | m | 센서 장착 위치 보정 |
+| `sensor_yaw_offset_deg` | deg | 센서 yaw 오프셋 |
+| `kp_x`, `kp_y`, `kp_yaw` | - | P 게인 |
+
+> 센서 중심을 라인 중앙에 맞추는 것이 기본 가정. 오프셋을 넣으면 로봇(또는 Base) 기준 정렬로 전환.
 
 > 💡 **기본 설계 원칙**
 > 센서(R4)가 라인 중앙에 위치하도록 제어하는 것이 목표이므로
@@ -113,9 +138,30 @@ ros2 launch line_drive_controller test_line_drive_sim.launch.py
 
 ---
 
-## 🎯 Control Interface
+## 🎯 인터페이스 (Topics & Services)
 
-### Topic Commands
+### 구독 (Subscribe)
+| 토픽 | 타입 | 설명 |
+|------|------|------|
+| `pose_topic` (기본: `/amr1/bcd_pose`) | PoseStamped | 센서 포즈 입력 |
+| `/line_drive/relative_x_goal` | Float64 | 상대 Δx 목표 |
+| `/line_drive/absolute_x_goal` | Float64 | 절대 x 목표 |
+| `/line_drive/go_forward` | Bool | 수동 전진 펄스 (hold) |
+| `/line_drive/go_backward` | Bool | 수동 후진 펄스 (hold) |
+
+### 퍼블리시 (Publish)
+| 토픽 | 타입 | 설명 |
+|------|------|------|
+| `cmd_topic` (기본: `/cmd_vel`) | Twist | 속도 명령 (vx, vy, wz) |
+
+### 서비스 (Services)
+| 서비스 | 타입 | 설명 |
+|--------|------|------|
+| `/line_drive/align_to_line` | Trigger | Yaw 정렬 시작 (ALIGN_YAW 흐름) |
+| `/line_drive/nudge_forward` | Trigger | Slow start 전진 단발 (마이크로) |
+| `/line_drive/align_y_only` | Trigger | (홀로노믹) Y-only 정렬 (필요시 yaw → y) |
+
+### 토픽 명령 (Goal 예시)
 
 ```bash
 # (상대) +1.2 m 전진
@@ -125,7 +171,7 @@ ros2 topic pub /line_drive/relative_x_goal std_msgs/Float64 '{data: 1.2}'
 ros2 topic pub /line_drive/absolute_x_goal std_msgs/Float64 '{data: 5.0}'
 ```
 
-### Service Commands
+### 서비스 명령
 
 ```bash
 # Yaw 정렬만 다시 실행
@@ -137,14 +183,14 @@ ros2 service call /line_drive/nudge_forward std_srvs/srv/Trigger {}
 
 ---
 
-## 🧪 Example Simulation Flow
+## 🧪 시뮬레이션 흐름 예시
 
 1. **Dummy PGV 시뮬레이터 실행** → `/cmd_vel` 명령을 받아 PoseStamped를 퍼블리시
 2. **Line Drive Controller** → PoseStamped를 받아 제어(정렬 → 전진)
 3. **One-shot Goal Node** → 1 초 후 `/line_drive/relative_x_goal` 발행
 
 ```bash
-ros2 launch line_drive_controller test_line_drive_sim.launch.py \
+ros2 launch pgv_tracing_mode test_line_drive_sim.launch.py \
   holonomic:=false use_relative:=true relative_goal:=2.0
 ```
 
@@ -156,26 +202,27 @@ ros2 launch line_drive_controller test_line_drive_sim.launch.py \
 
 ---
 
-## 📚 Directory Structure
+## 📚 디렉토리 구조
 
 ```
-PI_amr_v2_navigation/
-├── line_drive_controller/
-│   ├── line_drive_node.py          # Core controller node
-│   ├── sim_dummy_pgv.py            # Dummy PGV simulator
-│   ├── one_shot_goal.py            # Single-goal publisher
-│   ├── launch/
-│   │   ├── line_drive.launch.py
-│   │   └── test_line_drive_sim.launch.py
-│   └── config/
-│       ├── line_drive.params.yaml
-│       └── sim.params.yaml
-└── ...
+pgv_tracing_mode/
+├── pgv_tracing_mode/
+│   ├── line_tracing_node.py      # 핵심 LineDriveNode 구현
+│   ├── sim_dummy_pgv.py          # 더미 PGV 시뮬레이터
+│   ├── one_shot_goal.py          # 단발 목표/서비스 테스트 노드
+│   └── __init__.py
+├── launch/
+│   ├── line_drive.launch.py
+│   └── test_line_drive_sim.launch.py
+├── config/
+│   ├── line_drive.params.yaml
+│   └── sim.params.yaml
+└── test/ (lint / style 테스트)
 ```
 
 ---
 
-## 🧠 Design Notes
+## 🧠 설계 메모 (Design Notes)
 
 * **센서 기준 제어 (Default)**
   센서가 라인 중앙에 오도록 제어 → PGV 데이터를 직접 사용하므로 반응 빠름, 설정 단순.
@@ -192,9 +239,22 @@ PI_amr_v2_navigation/
 
 ---
 
-## 📞 Contact
+## 📞 문의 (Contact)
 
-**Maintainer:** Jaerak Son  (손재락)
-📧 **[jr@pitin-ev.com](mailto:jr@pitin-ev.com)**
+**Maintainer:** 손재락 (Jaerak Son)  
+📧 **jr@pitin-ev.com**
 
-> Please leave any questions or issues as [GitHub Issues](https://github.com/pitin-ev/PI_amr_v2_navigation/issues)!
+이슈 / 개선 제안은 GitHub Issues 로 남겨주세요.
+
+---
+
+### 라이선스
+특별한 명시가 없다면 패키지 내 소스는 Apache 2.0 호환 라이선스(ROS 2 기본 예시 기반)로 간주됩니다.
+프로젝트 요구에 따라 LICENSE 파일을 추가하세요.
+
+### 변경 로그 제안
+향후 변경 사항은 `CHANGELOG.rst` (ament 표준) 작성 권장.
+
+---
+
+Happy tracing! 🚀
