@@ -109,6 +109,11 @@ def ang_norm(a):
     return a
 
 
+def clamp(val, lo, hi):
+    """값을 [lo, hi] 범위로 제한 (포함)."""
+    return max(lo, min(hi, val))
+
+
 class Phase(Enum):
     IDLE = 0
     ALIGN_YAW = 1
@@ -134,6 +139,8 @@ class LineDriveNode(Node):
         self.declare_parameter('yaw_hysteresis_factor', 1.5)
         self.declare_parameter('tolerance_xy', 0.01)  # [m]
         self.declare_parameter('pose_timeout_sec', 0.2)  # 200ms 동안 pose 안 들어오면 stop
+        # Timeout 후 제어 재개 유예시간 (초) - pose 다시 들어와도 이 시간 동안은 정지 유지
+        self.declare_parameter('post_timeout_grace_sec', 1.0)
 
         self.declare_parameter('control_rate', 50.0)  # Hz
 
@@ -158,6 +165,12 @@ class LineDriveNode(Node):
         self.declare_parameter('kp_x', 1.0)
         self.declare_parameter('kp_y', 1.0)
         self.declare_parameter('kp_yaw', 2.0)
+        # 최대 미세 yaw 속도 (ALIGN_Y_ONLY에서 사용, soft clamp 적용)
+        self.declare_parameter('align_y_only_max_ang_vel', 0.2)
+        # 래핑 경계 진동 억제 구간 (deg): |yaw|가 (pi - band) 이상이면 부호 고정
+        self.declare_parameter('yaw_wrap_band_deg', 12.0)
+    # 역방향(±180°)도 정렬된 것으로 허용할지 여부 (라인 방향성 없을 때 true)
+        self.declare_parameter('allow_reverse_heading', True)
 
     # ---------------- 파라미터 값 조회 ----------------
         self.pose_topic = self.get_parameter('pose_topic').value
@@ -171,6 +184,7 @@ class LineDriveNode(Node):
         self.yaw_hysteresis_factor = float(self.get_parameter('yaw_hysteresis_factor').value)
         self.tol_xy = float(self.get_parameter('tolerance_xy').value)
         self.pose_timeout = float(self.get_parameter('pose_timeout_sec').value)
+        self.post_timeout_grace = float(self.get_parameter('post_timeout_grace_sec').value)
 
         self.rate_hz = float(self.get_parameter('control_rate').value)
 
@@ -192,6 +206,9 @@ class LineDriveNode(Node):
         self.kp_x = float(self.get_parameter('kp_x').value)
         self.kp_y = float(self.get_parameter('kp_y').value)
         self.kp_yaw = float(self.get_parameter('kp_yaw').value)
+        self.align_y_only_max_w = float(self.get_parameter('align_y_only_max_ang_vel').value)
+        self.yaw_wrap_band = math.radians(float(self.get_parameter('yaw_wrap_band_deg').value))
+        self.allow_reverse_heading = bool(self.get_parameter('allow_reverse_heading').value)
 
     # QoS: 고속/간헐 손실 허용 센서 대비 BEST_EFFORT + 작은 depth
         qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -215,11 +232,17 @@ class LineDriveNode(Node):
         self.phase = Phase.IDLE
         self.last_twist = Twist()
         self.last_pose_time = self.get_clock().now()
+        # Pose 미수신 timeout 상태 및 재개 grace 상태 관리
+        self.timeout_active = False
+        self.resume_block_until = None  # rclpy Time; None이면 grace 없음
+        self._last_grace_log_time = None
 
     # PGV 센서 포즈 (오프셋 적용 후)
         self.x = 0.0
         self.y = 0.0
         self.yaw = 0.0  # radians, angle around +z, yaw=0 is aligned with line +x
+        # 래핑 경계에서 부호 고정용
+        self.yaw_sign_fixed = 0  # -1 / +1 / 0
 
     # 목표 관리: 절대 x 또는 상대 Δx (start_x_for_rel 기준)
         self.goal_active = False
@@ -260,7 +283,20 @@ class LineDriveNode(Node):
         yaw = math.atan2(siny_cosp, cosy_cosp)
 
         # 센서 yaw 오프셋 적용 후 정규화된 yaw 저장
-        self.yaw = ang_norm(yaw + self.sensor_yaw_offset)
+        yaw_meas = ang_norm(yaw + self.sensor_yaw_offset)
+
+        # 경계 근처에서 sign flip 방지: |yaw|가 pi - wrap_band 이상이면 이전 부호 유지
+        abs_yaw = abs(yaw_meas)
+        if abs(abs_yaw - math.pi) < self.yaw_wrap_band:
+            # 경계 영역: 이전에 고정된 부호가 없다면 현재 측정 부호를 저장
+            if self.yaw_sign_fixed == 0:
+                self.yaw_sign_fixed = 1 if yaw_meas >= 0.0 else -1
+            # 고정된 부호 적용 (값 자체는 측정 그대로 두되 yaw_err 계산에서 사용할 예정)
+            self.yaw = yaw_meas
+        else:
+            # 경계 영역 벗어나면 부호 고정 해제 및 최신 값 반영
+            self.yaw_sign_fixed = 0
+            self.yaw = yaw_meas
 
     def _on_rel_goal(self, msg: Float64):
         """상대 x 목표 처리: 현재 x를 기준으로 Δx 설정 후 목표 활성화."""
@@ -342,6 +378,9 @@ class LineDriveNode(Node):
         """ALIGN_YAW 단계로 전이."""
         self.phase = Phase.ALIGN_YAW
         self.slow_start_until = None
+        # 정렬 시작 시 경계 근처라면 현재 고정 부호 채택, 아니면 초기화
+        if abs(abs(self.yaw) - math.pi) < self.yaw_wrap_band and self.yaw_sign_fixed == 0:
+            self.yaw_sign_fixed = 1 if self.yaw >= 0.0 else -1
 
     def _enter_align_y_only(self):
         """ALIGN_Y_ONLY 단계로 전이; yaw 히스테리시스 상태 초기화."""
@@ -390,8 +429,13 @@ class LineDriveNode(Node):
         # (원한다면 여기서 self.goal_active를 False로 만들어도 됨)
         speed = self.teleop_speed * (1.0 if direction > 0 else -1.0)
 
-        y_err = - self.y
-        yaw_err = ang_norm(0.0 - self.yaw)
+        y_err = -self.y
+        # 역방향 허용 시 0 또는 ±pi 중 더 가까운 목표까지의 (yaw - target) 에러
+        yaw_err = self._yaw_err(consider_reverse=True)
+        reverse_ok = self.allow_reverse_heading and abs(abs(self.yaw) - math.pi) < self.tol_yaw
+        if reverse_ok:
+            # 역방향 허용 + ±π 근처면 yaw 보정 생략
+            yaw_err = 0.0
 
         if self.holonomic:
             # vx = ±teleop_speed, vy는 y 보정, ω는 필요 시 미세 보정
@@ -408,14 +452,18 @@ class LineDriveNode(Node):
                 vy_cmd *= scale
 
             w_cmd = 0.0
-            if abs(yaw_err) > self.tol_yaw:
-                w_cmd = max(-0.2, min(0.2, self.kp_yaw * yaw_err))
+            # if (not reverse_ok) and abs(yaw_err) > self.tol_yaw:
+            #     # negative feedback: w = -kp * (yaw - target)
+            #     w_cmd_raw = -self.kp_yaw * yaw_err
+            #     # 작은 yaw 에러에서는 미세한 값 유지 (과도한 포화 방지)
+            #     self.get_logger().info(f"[manual holo] yaw_err={math.degrees(yaw_err):.2f} deg -> w_cmd_raw={w_cmd_raw:.3f} rad/s")
+            #     w_cmd = clamp(w_cmd_raw, -0.2, 0.2)
 
             self._publish_twist(vx_cmd, vy_cmd, w_cmd)
         else:
             # Non-holo: v = ±teleop_speed, ω로 y,yaw 수렴
             v_cmd = speed
-            w_cmd = self.kp_y * y_err + self.kp_yaw * yaw_err
+            w_cmd = self.kp_y * y_err + (0.0 if reverse_ok else -self.kp_yaw * yaw_err)
 
             v_cmd = self._slew_limit(v_cmd, self.last_twist.linear.x, self.acc_v / self.rate_hz)
             w_cmd = self._slew_limit(w_cmd, self.last_twist.angular.z, self.acc_w / self.rate_hz)
@@ -433,12 +481,36 @@ class LineDriveNode(Node):
         3) 상태(Phase)별 자동 동작
         """
         now = self.get_clock().now()
+        # 1) Pose timeout 감지: 멈추고 timeout_active 설정
         if (now - self.last_pose_time) > Duration(seconds=self.pose_timeout):
+            if not self.timeout_active:
+                self.timeout_active = True
+                self.resume_block_until = None  # 새 timeout 발생 시 이전 grace 폐기
+                self.get_logger().warn("[safety] pose timeout detected -> STOP")
             if (self.last_twist.linear.x != 0.0) or (self.last_twist.linear.y != 0.0) or (self.last_twist.angular.z != 0.0):
                 self._publish_twist(0.0, 0.0, 0.0)
-                self.get_logger().warn("[safety] pose timeout detected -> STOP")
             return
-        # 0) 수동(hold-to-run) 우선 처리
+        # 2) Timeout에서 회복된 첫 주기: grace 설정
+        if self.timeout_active:
+            self.timeout_active = False
+            self.resume_block_until = now + Duration(seconds=self.post_timeout_grace)
+            self._last_grace_log_time = now
+            self.get_logger().warn(f"[safety] pose recovered; holding still for {self.post_timeout_grace:.2f}s grace")
+        # 3) Grace 기간 동안은 제어 차단 (강제 정지 유지)
+        if self.resume_block_until is not None and now < self.resume_block_until:
+            # 주기적으로 남은 시간 로그 (0.25s 간격)
+            if self._last_grace_log_time is None or (now - self._last_grace_log_time) > Duration(seconds=0.25):
+                remaining = (self.resume_block_until - now).nanoseconds / 1e9
+                self.get_logger().info(f"[safety] grace active: {remaining:.2f}s remaining")
+                self._last_grace_log_time = now
+            if (self.last_twist.linear.x != 0.0) or (self.last_twist.linear.y != 0.0) or (self.last_twist.angular.z != 0.0):
+                self._publish_twist(0.0, 0.0, 0.0)
+            return
+        # Grace 종료
+        if self.resume_block_until is not None and now >= self.resume_block_until:
+            self.resume_block_until = None
+            self.get_logger().info("[safety] grace ended; resuming control")
+        # 0) 수동(hold-to-run) 우선 처리 (grace 기간엔 이미 return 되었음)
         manual_dir = self._manual_active()
         if manual_dir != 0:
             self._do_manual(manual_dir)
@@ -478,22 +550,35 @@ class LineDriveNode(Node):
 
         y-only 정렬 요청이면 ALIGN_Y_ONLY로, 아니면 SLOW_START로 분기.
         """
-        yaw_err = ang_norm(0.0 - self.yaw)
-        # P controller on yaw
-        w_cmd = self.kp_yaw * yaw_err
+        # 순수 +X 기준 yaw 에러만 사용하여 진동 최소화
+        forward_yaw_err = ang_norm(self.yaw - 0.0)  # (yaw - target)
+        # 역방향 허용 시 ±π 근처를 별도 정렬 완료 조건으로 취급
+        reverse_aligned = False
+        if self.allow_reverse_heading:
+            if abs(abs(self.yaw) - math.pi) < self.yaw_align_threshold:
+                reverse_aligned = True
+
+        # 제어용 에러: 역방향 정렬 완료 시 추가 회전 중지 위해 0, 아니면 forward 에러 사용
+        ctrl_yaw_err = 0.0 if reverse_aligned else forward_yaw_err
+        self.get_logger().info(
+            f"[align] yaw={math.degrees(self.yaw):.1f} deg, yaw_err={math.degrees(forward_yaw_err):.2f} deg, rev_allowed={self.allow_reverse_heading}, rev_aligned={reverse_aligned}")
+        # P controller on yaw (역방향 정렬이면 0)
+        w_cmd = -self.kp_yaw * ctrl_yaw_err  # negative feedback
         w_cmd = self._slew_limit(w_cmd, self.last_twist.angular.z, self.acc_w / self.rate_hz)
         w_cmd = max(-self.max_w, min(self.max_w, w_cmd))
         # keep linear zero during alignment
         self._publish_twist(0.0, 0.0, w_cmd)
 
-        if abs(yaw_err) <= self.yaw_align_threshold:
+        aligned_direct = abs(forward_yaw_err) <= self.yaw_align_threshold
+        aligned = aligned_direct or reverse_aligned
+        if aligned:
             # 완료 시 분기: y-align 요청이 있으면 ALIGN_Y_ONLY로, 아니면 기존 slow-start
             if self.y_align_requested:
                 self._enter_align_y_only()
-                self.get_logger().info("[align] yaw aligned; entering ALIGN_Y_ONLY")
+                self.get_logger().info(f"[align] {'reverse ' if reverse_aligned and not aligned_direct else ''}yaw aligned; entering ALIGN_Y_ONLY")
             else:
                 self._enter_slow_start()
-                self.get_logger().info("[align] yaw aligned; entering slow-start")
+                self.get_logger().info(f"[align] {'reverse ' if reverse_aligned and not aligned_direct else ''}yaw aligned; entering slow-start")
 
     def _do_align_y_only(self):
         """홀로노믹 Y축 정렬 (yaw 히스테리시스 포함).
@@ -508,7 +593,10 @@ class LineDriveNode(Node):
             return
 
         # yaw 드리프트가 커지면 미세 보정 허용 (hysteresis 적용)
-        yaw_err_raw = ang_norm(0.0 - self.yaw)
+        yaw_err_raw = self._yaw_err(consider_reverse=True)
+        # 역방향 허용 시 ±π 근처면 yaw 보정 비활성 처리
+        if self.allow_reverse_heading and abs(abs(self.yaw) - math.pi) < self.tol_yaw:
+            yaw_err_raw = 0.0
         yaw_abs = abs(yaw_err_raw)
         # Activate correction only if beyond outer band
         if not self.yaw_correction_active and yaw_abs > (self.tol_yaw * self.yaw_hysteresis_factor):
@@ -518,12 +606,15 @@ class LineDriveNode(Node):
             self.yaw_correction_active = False
 
         w_cmd = 0.0
-        if self.yaw_correction_active:
-            w_cmd_raw = self.kp_yaw * yaw_err_raw
-            # small deadband to avoid jitter
-            if abs(w_cmd_raw) < 0.02:
-                w_cmd_raw = 0.0
-            w_cmd = max(-0.2, min(0.2, w_cmd_raw))
+        # if self.yaw_correction_active:
+        #     w_cmd_raw = self.kp_yaw * yaw_err_raw
+        #     # small deadband to avoid jitter near zero
+        #     if abs(w_cmd_raw) < 0.02:
+        #         w_cmd_raw = 0.0
+        #     # Soft saturation: 출력은 [-align_y_only_max_w, +align_y_only_max_w]로 부드럽게 제한
+        #     # tanh를 이용해 포화 구간에서도 연속적인 변화량 제공 (갑작스런 -0.2 고정 감소)
+        #     max_w = self.align_y_only_max_w
+        #     w_cmd = max_w * math.tanh(w_cmd_raw / max_w)  # smooth clamp
 
         # vy만 사용해서 y를 0으로 수렴 (vx=0)
         y_err = -self.y
@@ -571,8 +662,9 @@ class LineDriveNode(Node):
             return
 
         x_err = x_target - self.x
-        y_err = - self.y           # we want y -> 0
-        yaw_err = ang_norm(0.0 - self.yaw)  # we want yaw -> 0
+        y_err = -self.y            # we want y -> 0
+        yaw_err = self._yaw_err(consider_reverse=True)  # (yaw - target)
+        reverse_ok = self.allow_reverse_heading and abs(abs(self.yaw) - math.pi) < self.tol_yaw
 
         # Goal check
         if abs(x_err) <= self.tol_xy and abs(self.y) <= self.tol_xy:
@@ -598,9 +690,10 @@ class LineDriveNode(Node):
 
             # 정렬 이후이므로 yaw 오차가 크면 보정 한 번 더(옵션)
             w_cmd = 0.0
-            if abs(yaw_err) > self.tol_yaw:
-                # 아주 미세 보정만 허용 (클램프)
-                w_cmd = max(-0.2, min(0.2, self.kp_yaw * yaw_err))
+            # if (abs(yaw_err) > self.tol_yaw) and (not reverse_ok):
+            #     # negative feedback: w = -kp * (yaw - target)
+            #     w_cmd_raw = -self.kp_yaw * yaw_err
+            #     w_cmd = clamp(w_cmd_raw, -0.2, 0.2)
 
             self._publish_twist(vx_cmd, vy_cmd, w_cmd)
 
@@ -608,7 +701,7 @@ class LineDriveNode(Node):
             # Non-holonomic: v, ω만 사용
             # x_err로 전진속도, (y_err, yaw_err)로 각속도
             v_cmd = self.kp_x * x_err
-            w_cmd = self.kp_y * y_err + self.kp_yaw * yaw_err
+            w_cmd = self.kp_y * y_err + (0.0 if reverse_ok else -self.kp_yaw * yaw_err)
 
             v_cmd = self._slew_limit(v_cmd, self.last_twist.linear.x, self.acc_v / self.rate_hz)
             w_cmd = self._slew_limit(w_cmd, self.last_twist.angular.z, self.acc_w / self.rate_hz)
@@ -627,6 +720,33 @@ class LineDriveNode(Node):
         t.angular.z = float(wz)
         self.cmd_pub.publish(t)
         self.last_twist = t
+
+    def _yaw_err(self, consider_reverse: bool = False):
+        """(yaw - target) 형태의 heading 오차 반환.
+
+        target 기본값은 0 rad(+X). consider_reverse=True이고 allow_reverse_heading=True이면
+        0 또는 ±π 중에서 |yaw - target_candidate|가 더 작은 목표를 선택.
+
+        제어식은 w = -kp * yaw_err 로 사용하여 음의 피드백이 되도록 한다.
+
+        경계(±π) 부근 sign flip 억제를 위해 yaw_sign_fixed 적용.
+        """
+        # 측정 yaw 안정화
+        if self.yaw_sign_fixed != 0 and abs(abs(self.yaw) - math.pi) < self.yaw_wrap_band:
+            yaw_meas = self.yaw_sign_fixed * abs(self.yaw)
+        else:
+            yaw_meas = self.yaw
+
+        # 후보 1: forward (0)
+        forward_err = ang_norm(yaw_meas - 0.0)
+        if not (consider_reverse and self.allow_reverse_heading):
+            return forward_err
+
+        # 후보 2: reverse (±π same sign as yaw)
+        target_rev = math.copysign(math.pi, yaw_meas if yaw_meas != 0 else 1.0)
+        err_rev = ang_norm(yaw_meas - target_rev)
+
+        return err_rev if abs(err_rev) < abs(forward_err) else forward_err
 
     @staticmethod
     def _slew_limit(target, current, step):
