@@ -118,6 +118,8 @@ class Phase(Enum):
     RUNNING = 3
     DONE = 4
     ALIGN_Y_ONLY = 5  # NEW: holonomic 전용 y축 정렬 단계
+    MICRO_XY=6  # NEW: 마이크로 컨트롤러 XY 이동 단계
+    MICRO_YAW=7  # NEW: 마이크로 컨트롤러 YAW 회전 단계
 
 
 class LineDriveNode(Node):
@@ -258,6 +260,16 @@ class LineDriveNode(Node):
         # Internal flag for yaw correction hysteresis in ALIGN_Y_ONLY
         self.yaw_correction_active = False
 
+    # 마이크로 컨트롤러 전역 변수 
+        self._micro_last_time = self.get_clock().now()
+        self._micro_interval = 1.0  # 20 ms
+        self._microcon_active = False
+        self._microcon_delta_x = 0.0
+        self._microcon_delta_y = 0.0
+        self._microcon_delta_yaw = 0.0
+        self._microcon_target_x = 0.0
+
+
     # 타이머: 주기적 제어 루프 실행
         period = 1.0 / self.rate_hz
         self.timer = self.create_timer(period, self._control_loop)
@@ -396,6 +408,16 @@ class LineDriveNode(Node):
         """RUNNING (목표 추종) 단계로 전이."""
         self.phase = Phase.RUNNING
 
+    def _enter_micro_xy(self):
+        """MICRO_XY 단계로 전이."""
+        self.phase = Phase.MICRO_XY
+        self._microcon_active = False  # 초기화
+    
+    def _enter_micro_yaw(self):
+        """MICRO_YAW 단계로 전이."""
+        self.phase = Phase.MICRO_YAW
+        self._microcon_active = False  # 초기화
+
     def _enter_done(self):
         """DONE 단계: 0 속도 명령 발행 및 목표 비활성화."""
         self.phase = Phase.DONE
@@ -522,7 +544,7 @@ class LineDriveNode(Node):
             return
 
     # (C) 수동 아님 + "아무 목표/페이즈도 없음" => 정지 후 리턴
-        if (not self.goal_active) and (self.phase not in (Phase.ALIGN_YAW, Phase.SLOW_START, Phase.RUNNING, Phase.ALIGN_Y_ONLY)):
+        if (not self.goal_active) and (self.phase not in (Phase.ALIGN_YAW, Phase.SLOW_START, Phase.RUNNING, Phase.ALIGN_Y_ONLY, Phase.MICRO_XY, Phase.MICRO_YAW)):
             if (self.last_twist.linear.x != 0.0) or (self.last_twist.linear.y != 0.0) or (self.last_twist.angular.z != 0.0):
                 self._publish_twist(0.0, 0.0, 0.0)
             return
@@ -548,6 +570,14 @@ class LineDriveNode(Node):
             # keep stopped
             self._publish_twist(0.0, 0.0, 0.0)
             return
+        
+        if self.phase == Phase.MICRO_XY:
+            self._do_micro_xy()
+            return
+        if self.phase == Phase.MICRO_YAW:
+            self._do_micro_yaw()
+            return
+    
 
     # ---------------- Behaviors ----------------
     def _do_align_yaw(self):
@@ -673,8 +703,8 @@ class LineDriveNode(Node):
 
         # Goal check
         if abs(x_err) <= self.tol_xy and abs(self.y) <= self.tol_xy:
-            self._enter_done()
-            self.get_logger().info("[goal] reached")
+            self._enter_micro_xy()
+            self.get_logger().info("[goal] approach reached and entering MICRO_XY")
             self.get_logger().info(f"[goal] final pose: x={self.x:.3f}, y={self.y:.3f}, yaw={math.degrees(self.yaw):.2f} deg")
             return
 
@@ -756,6 +786,95 @@ class LineDriveNode(Node):
 
         return err_rev if abs(err_rev) < abs(forward_err) else forward_err
 
+    def _do_xy_align_micro(self):
+        """XY 정렬: x,y 모두 0으로 수렴. 딜레이 및 안정화를 위해 실시간 제어가 아니라 긴 시간의 클로즈루프 제어"""
+
+        if not self._microcon_active:
+            x_target = 0.0
+            if self.goal_abs_x is not None:
+                x_target = self.goal_abs_x
+            elif self.goal_rel_dx is not None and self.start_x_for_rel is not None:
+                x_target = self.start_x_for_rel + self.goal_rel_dx
+            
+            self._microcon_target_x = x_target
+            self._micro_last_time= self.get_clock().now()
+            self._microcon_delta_x = x_target - self.x
+            if self._microcon_delta_x>0.01:
+                self._microcon_delta_x=0.01
+            if self._microcon_delta_x<-0.01:
+                self._microcon_delta_x=-0.01
+            self._microcon_delta_y = 0.0 - self.y
+            if self._microcon_delta_y>0.01:
+                self._microcon_delta_y=0.01
+            if self._microcon_delta_y<-0.01:
+                self._microcon_delta_y=-0.01
+            self._microcon_delta_yaw = 0.0 - self.yaw
+            self._microcon_active = True
+        
+        time_phase_delta = (self.get_clock().now() - self._micro_last_time).nanoseconds / 1e9 
+        time_phase=time_phase_delta / self._micro_interval
+
+        if time_phase <1.0: # 가속 구간
+            # 에러 벡터 기반 3차 보간 -> 속도 지령 계산 -> 출력
+            vx_cmd = cubic_interpolation(0.0, self._microcon_delta_x, time_phase, 0.0, 1.0)[1]
+            vy_cmd = cubic_interpolation(0.0, self._microcon_delta_y, time_phase, 0.0, 1.0)[1]
+            self._publish_twist(vx_cmd, vy_cmd, 0)
+
+        elif time_phase >=1.0 and time_phase <1.5: # 정지 위치 안정화
+            vx_cmd = 0.0
+            vy_cmd = 0.0
+            self._publish_twist(vx_cmd, vy_cmd, 0)
+
+        else: # 종료
+            self._microcon_active = False
+            delx= self.x - self._microcon_target_x
+            dely= self.y
+            self.get_logger().info(f"[micro_xy_align] micro control finished. Final error: Δx={delx:.4f} m, Δy={dely:.4f} m")
+            if abs(delx)<= 0.003 and abs(dely)<= 0.003:
+                if self.yaw<= 0.03 and self.yaw>= -0.03:
+                    self._enter_done()
+                    return
+                else:
+                    self._enter_micro_yaw()
+                    return
+            else:
+                pass
+            self._publish_twist(0.0, 0.0, 0.0)
+
+    def _do_yaw_align_micro(self):
+        """Yaw 정렬: yaw를 0으로 수렴. 딜레이 및 안정화를 위해 실시간 제어가 아니라 긴 시간의 클로즈루프 제어"""
+
+        if not self._microcon_active:
+            self._micro_last_time= self.get_clock().now()
+            self._microcon_delta_yaw = 0.0 - self.yaw
+            if self._microcon_delta_yaw>0.1:
+                self._microcon_delta_yaw=0.1
+            if self._microcon_delta_yaw<-0.1:
+                self._microcon_delta_yaw=-0.1
+            self._microcon_active = True
+        
+        time_phase_delta = (self.get_clock().now() - self._micro_last_time).nanoseconds / 1e9 
+        time_phase=time_phase_delta / self._micro_interval
+
+        if time_phase <1.0: # 가속 구간
+            # 에러 벡터 기반 3차 보간 -> 속도 지령 계산 -> 출력
+            w_cmd = cubic_interpolation(0.0, self._microcon_delta_yaw, time_phase, 0.0, 1.0)[1]
+            x_cmd = w_cmd/0.8 # 센서 점을 기준으로 회전하게 하기 위한 보정
+            self._publish_twist(x_cmd, 0.0, w_cmd)
+
+        elif time_phase >=1.0 and time_phase <1.5: # 정지 위치 안정화
+            self._publish_twist(0.0, 0.0, 0.0)
+
+        else: # 종료
+            self._microcon_active = False
+            self.get_logger().info(f"[micro_yaw_align] micro control finished. Final error: Δyaw={self.yaw:.2f} deg")
+            if abs(self.yaw) <= 0.01:
+                self._enter_micro_xy()
+                return
+            else:
+                pass
+            self._publish_twist(0.0, 0.0, 0.0)
+
     @staticmethod
     def _slew_limit(target, current, step):
         """한 주기당 변화량 제한 (간단한 slew rate 제한)."""
@@ -766,6 +885,24 @@ class LineDriveNode(Node):
             return current - step
         return target
 
+def cubic_interpolation(x0,x1,tc,ts,te):
+    """cubic interpolation function
+
+    Args:
+        x0 (float): start value
+        x1 (float): end value
+        tc (float): current time
+        ts (float): start time
+        te (float): end time
+    Returns:
+        float : interpolated position
+        float : interpolated velocity
+    """
+    if tc<ts: tc=ts
+    if tc>te: tc=te
+    if te-ts<0.1: te=ts+0.1
+    t=(tc-ts)/(te-ts)
+    return x0+(x1-x0)*t*t*(3-2*t) , (x1-x0)*t*(6-6*t) 
 
 def main(args=None):
     rclpy.init(args=args)
