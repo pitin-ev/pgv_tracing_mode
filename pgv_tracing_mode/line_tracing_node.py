@@ -215,12 +215,13 @@ class LineDriveNode(Node):
                          history=HistoryPolicy.KEEP_LAST, depth=5)
 
     # ---------------- I/O (토픽/서비스) ----------------
-        self.nav_cmd_sub = self.create_subscription(NavCommander, 'amr1/nav_command', self.nav_commander_callback, 10)
+        self.nav_cmd_sub = self.create_subscription(NavCommander, 'amr11/nav_command', self.nav_commander_callback, 10)
         self.pose_sub = self.create_subscription(PoseStamped, self.pose_topic, self._on_pose, qos)
         self.rel_goal_sub = self.create_subscription(Float64, '/line_drive/relative_x_goal', self._on_rel_goal, 10)
         self.abs_goal_sub = self.create_subscription(Float64, '/line_drive/absolute_x_goal', self._on_abs_goal, 10)
         self.cmd_pub = self.create_publisher(Twist, self.cmd_topic, 10)
-        self.nav_status_pub = self.create_publisher(NavStatus, 'amr1/nav_status', 10)
+        self.nav_cmd_pub = self.create_publisher(NavCommander, 'amr11/nav_command', 10)
+        self.nav_status_pub = self.create_publisher(NavStatus, 'amr11/nav_status', 10)
 
         self.srv_align = self.create_service(Trigger, '/line_drive/align_to_line', self._srv_align)
         self.srv_nudge = self.create_service(Trigger, '/line_drive/nudge_forward', self._srv_nudge)
@@ -290,12 +291,18 @@ class LineDriveNode(Node):
         if command == NavCommander.CMD_START:
             self.get_logger().info(f'Nav_Commander Received: CMD_START, Mode: {msg.mode}, Target_Point: {msg.target_point}, Target_Points: {msg.target_points}, Poses: {len(msg.poses)}')
             if msg.mode == NavCommander.MODE_GOTO:
-                self.goal_abs_x = float(msg.target_point)
-                self.goal_rel_dx = None
-                self.start_x_for_rel = None
-                self.goal_active = True
-                self._enter_align_phase()
-                self.get_logger().info(f"[goal] absolute x*={self.goal_abs_x:.3f} m")
+                if msg.target_point == 0:
+                    self.goal_abs_x = 10.5
+                elif msg.target_point == 1:
+                    self.goal_abs_x = 13.58
+                elif msg.target_point == 2:
+                    self.goal_abs_x = None
+                if self.goal_abs_x is not None:
+                    self.goal_rel_dx = None
+                    self.start_x_for_rel = None
+                    self.goal_active = True
+                    self._enter_align_phase()
+                    self.get_logger().info(f"[goal] absolute x*={self.goal_abs_x:.3f} m")
 
 
     def _on_pose(self, msg: PoseStamped):
@@ -443,6 +450,11 @@ class LineDriveNode(Node):
         """DONE 단계: 0 속도 명령 발행 및 목표 비활성화."""
         self.phase = Phase.DONE
         self.goal_active = False
+        nav_status_msg = NavStatus()
+        nav_status_msg.reqid = self.req_id
+        nav_status_msg.seqid = self.seq_id
+        nav_status_msg.state = NavStatus.SUCCEEDED
+        self.nav_status_pub.publish(nav_status_msg)
         self._publish_twist(0.0, 0.0, 0.0)
 
     # ---------------- Manual helpers ----------------
@@ -557,6 +569,14 @@ class LineDriveNode(Node):
     # (A4) Grace 종료: 정상 제어 재개
         if self.resume_block_until is not None and now >= self.resume_block_until:
             self.resume_block_until = None
+            if self.goal_abs_x is not None or self.goal_rel_dx is not None:
+                if abs(self.goal_abs_x - self.x) < 1.0:
+                    nav_cmd_msg = NavCommander()
+                    nav_cmd_msg.reqid = self.req_id
+                    nav_cmd_msg.seqid = self.seq_id
+                    nav_cmd_msg.cmd = NavCommander.CMD_CANCEL
+                    self.nav_cmd_pub.publish(nav_cmd_msg)
+                    self.get_logger().info(f"[MODE CHANGE] sent CMD_CANCEL to Nav_Commander upon resuming control")
             self.get_logger().info("[safety] grace ended; resuming control")
     # (B) 수동(hold-to-run) 우선 처리 (grace 기간엔 이미 return)
         manual_dir = self._manual_active()
@@ -593,10 +613,10 @@ class LineDriveNode(Node):
             return
         
         if self.phase == Phase.MICRO_XY:
-            self._do_micro_xy()
+            self._do_xy_align_micro()
             return
         if self.phase == Phase.MICRO_YAW:
-            self._do_micro_yaw()
+            self._do_yaw_align_micro()
             return
     
 
@@ -727,11 +747,11 @@ class LineDriveNode(Node):
             self._enter_micro_xy()
             self.get_logger().info("[goal] approach reached and entering MICRO_XY")
             self.get_logger().info(f"[goal] final pose: x={self.x:.3f}, y={self.y:.3f}, yaw={math.degrees(self.yaw):.2f} deg")
-            nav_status_msg = NavStatus()
-            nav_status_msg.reqid = self.req_id
-            nav_status_msg.seqid = self.seq_id
-            nav_status_msg.state = NavStatus.SUCCEEDED
-            self.nav_status_pub.publish(nav_status_msg)
+            # nav_status_msg = NavStatus()
+            # nav_status_msg.reqid = self.req_id
+            # nav_status_msg.seqid = self.seq_id
+            # nav_status_msg.state = NavStatus.SUCCEEDED
+            # self.nav_status_pub.publish(nav_status_msg)
             return
 
         if self.holonomic:
@@ -893,13 +913,14 @@ class LineDriveNode(Node):
             vx_cmd = wz_cmd/0.51 # 센서 점을 기준으로 회전하게 하기 위한 보정
             self._publish_twist(vx_cmd, 0.0, wz_cmd)
 
-        elif time_phase <1.3: # 가속 구간
+        elif time_phase <1.0: # 가속 구간
             # 에러 벡터 기반 3차 보간 -> 속도 지령 계산 -> 출력
-            w_cmd = cubic_interpolation(0.0, self._microcon_delta_yaw, time_phase, 0.3, 1.3)[1]
+            w_cmd = cubic_interpolation(0.0, self._microcon_delta_yaw, time_phase, 0.3, 1.0)[1]
             x_cmd = w_cmd/0.51 # 센서 점을 기준으로 회전하게 하기 위한 보정
+            self.get_logger().info(f"[micro_yaw_align] time_phase={time_phase:.3f}, wz_cmd={w_cmd:.6f} rad/s, x_cmd={x_cmd:.6f} m/s")
             self._publish_twist(x_cmd, 0.0, w_cmd)
 
-        elif time_phase >=1.3 and time_phase <1.6: # 정지 위치 안정화
+        elif time_phase >=1.0 and time_phase <1.3: # 정지 위치 안정화
             self._publish_twist(0.0, 0.0, 0.0)
 
         else: # 종료
@@ -927,7 +948,7 @@ def cubic_interpolation(x0,x1,tc,ts,te):
 
     Args:
         x0 (float): start value
-        x1 (float): end value
+        x1 (float): end valuemicro_yaw
         tc (float): current time
         ts (float): start time
         te (float): end time

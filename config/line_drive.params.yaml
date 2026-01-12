@@ -3,7 +3,7 @@ line_drive:
     # =========================
     # Topics (입출력 토픽)
     # =========================
-    pose_topic: "/amr1/bcd_pose"   # 입력 PoseStamped 토픽 경로. PGV(R4) 노드가 퍼블리시하는 센서 포즈.
+    pose_topic: "/amr11/bcd_pose"   # 입력 PoseStamped 토픽 경로. PGV(R4) 노드가 퍼블리시하는 센서 포즈.
                                   # 좌표계 가정: x=라인 진행 방향(+), y=라인 좌/우 오프셋(+좌측), yaw=라인 대비 각도(rad).
                                   # 센서가 측면 장착이면 아래 sensor_*_offset으로 보정 가능.
 
