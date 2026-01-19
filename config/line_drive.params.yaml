@@ -22,10 +22,10 @@ line_drive:
     yaw_align_threshold_deg: 1.0   # [deg] 초기 정렬 단계 종료 기준. |yaw_err| ≤ 이 값일 때 SLOW_START 진입.
                                   # 너무 작게 잡으면 정렬이 오래 걸림. (권장 1~3deg)
 
-    tolerance_yaw_deg: 2.0         # [deg] 주행 중 허용할 yaw 오차(홀로노믹일 때 미세 보정 임계치).
+    tolerance_yaw_deg: 3.0         # [deg] 주행 중 허용할 yaw 오차(홀로노믹일 때 미세 보정 임계치).
                                   # 이 값 초과 시 소량의 ω로 미세 보정(최대 ±0.2rad/s 제한). (권장 2~5deg)
 
-    tolerance_xy: 0.001             # [m] 목표 도달 판정에 쓰는 선형 오차. |x_err| ≤ tol AND |y| ≤ tol 이면 도달.
+    tolerance_xy: 0.006             # [m] 목표 도달 판정에 쓰는 선형 오차. |x_err| ≤ tol AND |y| ≤ tol 이면 도달.
                                   # 너무 작으면 정지 진동(헌팅) 유발 가능. (권장 0.005~0.02m)
 
     yaw_hysteresis_factor: 1.5     # [-] ALIGN_Y_ONLY에서 yaw 보정 활성/비활성 히스테리시스 외곽 임계 배수.
@@ -80,7 +80,7 @@ line_drive:
     # =========================
     # Sensor offsets (측면 장착 PGV 보정)
     # =========================
-    sensor_yaw_offset_deg: 180.0     # [deg] 센서의 yaw 영점 오차 보정 (라인 기준 + 회전이 +).
+    sensor_yaw_offset_deg: 0.0     # [deg] 센서의 yaw 영점 오차 보정 (라인 기준 + 회전이 +).
                                   # 센서 마운트가 라인 기준 약간 기울면 여기서 보정.
 
     sensor_x_offset: 0.0           # [m] 센서가 로봇 기준 x축으로 떨어진 거리(+전방, -후방).
