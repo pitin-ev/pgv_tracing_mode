@@ -112,6 +112,11 @@ def clamp(val, lo, hi):
     return max(lo, min(hi, val))
 
 
+# cubic_interpolation()에서 0으로 나누는 상황을 피하기 위한 최소 시간 구간
+# (기존 코드에 하드코딩되어 있었고, 의미가 명확한 이름이 필요해서 상수로 분리)
+CUBIC_MIN_DURATION_SEC = 0.1
+
+
 class Phase(Enum):
     IDLE = 0
     ALIGN_YAW = 1
@@ -131,6 +136,18 @@ class LineDriveNode(Node):
     # (상단 모듈 주석에 상세 설명 있음)
         self.declare_parameter('pose_topic', '/amr1/bcd_pose')
         self.declare_parameter('cmd_topic', '/cmd_vel')
+
+        # 기타 입출력 토픽/서비스명 (기존 코드에 문자열 리터럴로 흩어져 있어 설정/리팩토링이 어려워 파라미터화)
+        self.declare_parameter('relative_x_goal_topic', '/line_drive/relative_x_goal')  # 추가 이유: 토픽명 하드코딩 제거
+        self.declare_parameter('absolute_x_goal_topic', '/line_drive/absolute_x_goal')  # 추가 이유: 토픽명 하드코딩 제거
+        self.declare_parameter('go_forward_topic', '/line_drive/go_forward')  # 추가 이유: 토픽명 하드코딩 제거
+        self.declare_parameter('go_backward_topic', '/line_drive/go_backward')  # 추가 이유: 토픽명 하드코딩 제거
+
+        self.declare_parameter('srv_align_name', '/line_drive/align_to_line')  # 추가 이유: 서비스명 하드코딩 제거
+        self.declare_parameter('srv_nudge_name', '/line_drive/nudge_forward')  # 추가 이유: 서비스명 하드코딩 제거
+        self.declare_parameter('srv_align_y_only_name', '/line_drive/align_y_only')  # 추가 이유: 서비스명 하드코딩 제거
+
+        self.declare_parameter('io_queue_depth', 10)  # 추가 이유: I/O 큐 depth를 노드/환경에 맞게 조정
 
         self.declare_parameter('holonomic', True)  # True: vx,vy only (w=0 after align). False: v,w only
         self.declare_parameter('yaw_align_threshold_deg', 2.0)
@@ -172,9 +189,49 @@ class LineDriveNode(Node):
     # 역방향(±180°)도 정렬된 것으로 허용할지 여부 (라인 방향성 없을 때 true)
         self.declare_parameter('allow_reverse_heading', True)
 
+        # NavCommander / NavStatus 토픽 (기존 코드에 하드코딩되어 로봇/네임스페이스 변경이 어려워 파라미터화)
+        self.declare_parameter('nav_command_topic', 'amr11/nav_command')  # 추가 이유: 토픽명 하드코딩 제거(로봇별 토픽명 상이)
+        self.declare_parameter('nav_status_topic', 'amr11/nav_status')    # 추가 이유: 토픽명 하드코딩 제거(로봇별 토픽명 상이)
+
+        # pose QoS depth (기존 코드에 depth=5 하드코딩되어 있어 센서 주기/네트워크 상황별 조정이 어려워 파라미터화)
+        self.declare_parameter('pose_qos_depth', 5)  # 추가 이유: 환경에 따라 depth 튜닝 필요
+
+        # MODE_GOTO에서 target_point별 목표 x값 (기존 코드에 10.58/13.58 하드코딩 → YAML에서 조정 가능하도록)
+        self.declare_parameter('goto_target_abs_x_list', [10.58, 13.58])  # 추가 이유: 맵/라인 변경 시 코드 수정 없이 튜닝
+
+        # grace 중 남은 시간 로그 주기 (기존 코드에 0.25s 하드코딩 → 로그 스팸/디버그 편의 조절)
+        self.declare_parameter('grace_log_period_sec', 0.25)  # 추가 이유: 운영 시 로그 양 조절 필요
+
+        # grace 종료 시 NavCommander cancel을 보낼 조건 거리 (기존 코드에 1.0m 하드코딩)
+        self.declare_parameter('resume_cancel_goal_distance_m', 1.0)  # 추가 이유: 목표 재개/취소 판단 기준을 현장에서 조정
+
+        # 마이크로(미세) 정렬 단계 파라미터들 (기존 코드 매직 넘버를 한 곳으로 정리)
+        self.declare_parameter('micro_interval_sec', 0.02)  # 추가 이유: 기존 코드 주석(20ms)과 실제 값(1.0s) 불일치, 제어 주기 튜닝 필요
+        self.declare_parameter('micro_max_delta_xy_m', 0.03)  # 추가 이유: 한 번에 움직이는 최대 보정량 제한(안전/안정성)
+        self.declare_parameter('micro_xy_initial_speed', 0.0001)  # 추가 이유: 초기 구간에서 미세한 "시동" 속도 상수 하드코딩 제거
+        self.declare_parameter('micro_xy_t_accel_end', 0.3)  # 추가 이유: 마이크로 XY 프로파일 구간 경계값 하드코딩 제거
+        self.declare_parameter('micro_xy_t_profile_end', 1.3)  # 추가 이유: 마이크로 XY 프로파일 구간 경계값 하드코딩 제거
+        self.declare_parameter('micro_xy_t_settle_end', 1.6)  # 추가 이유: 마이크로 XY 정지 안정화 구간 경계값 하드코딩 제거
+
+        self.declare_parameter('micro_yaw_max_delta_rad', 0.3)  # 추가 이유: 마이크로 Yaw에서 목표 회전량 상한 하드코딩 제거
+        self.declare_parameter('micro_yaw_t_accel_end', 0.3)  # 추가 이유: 마이크로 Yaw 프로파일 구간 경계값 하드코딩 제거
+        self.declare_parameter('micro_yaw_t_profile_end', 1.0)  # 추가 이유: 마이크로 Yaw 프로파일 구간 경계값 하드코딩 제거
+        self.declare_parameter('micro_yaw_t_settle_end', 1.3)  # 추가 이유: 마이크로 Yaw 정지 안정화 구간 경계값 하드코딩 제거
+        self.declare_parameter('micro_yaw_rotation_radius_m', 0.51)  # 추가 이유: v=ω*r에서 r(센서 회전 반경) 하드코딩 제거(로봇 기구마다 다름)
+
     # ---------------- 파라미터 값 조회 ----------------
         self.pose_topic = self.get_parameter('pose_topic').value
         self.cmd_topic = self.get_parameter('cmd_topic').value
+
+        self.relative_x_goal_topic = str(self.get_parameter('relative_x_goal_topic').value)
+        self.absolute_x_goal_topic = str(self.get_parameter('absolute_x_goal_topic').value)
+        self.go_forward_topic = str(self.get_parameter('go_forward_topic').value)
+        self.go_backward_topic = str(self.get_parameter('go_backward_topic').value)
+        self.srv_align_name = str(self.get_parameter('srv_align_name').value)
+        self.srv_nudge_name = str(self.get_parameter('srv_nudge_name').value)
+        self.srv_align_y_only_name = str(self.get_parameter('srv_align_y_only_name').value)
+        self.io_queue_depth = int(self.get_parameter('io_queue_depth').value)
+
         self.holonomic = bool(self.get_parameter('holonomic').value)
 
 
@@ -210,26 +267,51 @@ class LineDriveNode(Node):
         self.yaw_wrap_band = math.radians(float(self.get_parameter('yaw_wrap_band_deg').value))
         self.allow_reverse_heading = bool(self.get_parameter('allow_reverse_heading').value)
 
+        self.nav_command_topic = str(self.get_parameter('nav_command_topic').value)
+        self.nav_status_topic = str(self.get_parameter('nav_status_topic').value)
+
+        self.pose_qos_depth = int(self.get_parameter('pose_qos_depth').value)
+        self.goto_target_abs_x_list = [float(v) for v in self.get_parameter('goto_target_abs_x_list').value]
+        self.grace_log_period = float(self.get_parameter('grace_log_period_sec').value)
+        self.resume_cancel_goal_distance = float(self.get_parameter('resume_cancel_goal_distance_m').value)
+
+        self.micro_interval_sec = float(self.get_parameter('micro_interval_sec').value)
+        self.micro_max_delta_xy = float(self.get_parameter('micro_max_delta_xy_m').value)
+        self.micro_xy_initial_speed = float(self.get_parameter('micro_xy_initial_speed').value)
+        self.micro_xy_t_accel_end = float(self.get_parameter('micro_xy_t_accel_end').value)
+        self.micro_xy_t_profile_end = float(self.get_parameter('micro_xy_t_profile_end').value)
+        self.micro_xy_t_settle_end = float(self.get_parameter('micro_xy_t_settle_end').value)
+
+        self.micro_yaw_max_delta = float(self.get_parameter('micro_yaw_max_delta_rad').value)
+        self.micro_yaw_t_accel_end = float(self.get_parameter('micro_yaw_t_accel_end').value)
+        self.micro_yaw_t_profile_end = float(self.get_parameter('micro_yaw_t_profile_end').value)
+        self.micro_yaw_t_settle_end = float(self.get_parameter('micro_yaw_t_settle_end').value)
+        self.micro_yaw_rotation_radius = float(self.get_parameter('micro_yaw_rotation_radius_m').value)
+
+        # 작은 값/부호 기본값 (매직 넘버를 이름으로 명확화)
+        self._eps = 1e-6  # 추가 이유: 0으로 나누기 방지용 상수(여러 곳에서 사용)
+        self._copysign_fallback = 1.0  # 추가 이유: copysign에서 0 입력 시 방향 기본값 명시
+
     # QoS: 고속/간헐 손실 허용 센서 대비 BEST_EFFORT + 작은 depth
         qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
-                         history=HistoryPolicy.KEEP_LAST, depth=5)
+                 history=HistoryPolicy.KEEP_LAST, depth=self.pose_qos_depth)
 
     # ---------------- I/O (토픽/서비스) ----------------
-        self.nav_cmd_sub = self.create_subscription(NavCommander, 'amr11/nav_command', self.nav_commander_callback, 10)
+        self.nav_cmd_sub = self.create_subscription(NavCommander, self.nav_command_topic, self.nav_commander_callback, self.io_queue_depth)
         self.pose_sub = self.create_subscription(PoseStamped, self.pose_topic, self._on_pose, qos)
-        self.rel_goal_sub = self.create_subscription(Float64, '/line_drive/relative_x_goal', self._on_rel_goal, 10)
-        self.abs_goal_sub = self.create_subscription(Float64, '/line_drive/absolute_x_goal', self._on_abs_goal, 10)
-        self.cmd_pub = self.create_publisher(Twist, self.cmd_topic, 10)
-        self.nav_cmd_pub = self.create_publisher(NavCommander, 'amr11/nav_command', 10)
-        self.nav_status_pub = self.create_publisher(NavStatus, 'amr11/nav_status', 10)
+        self.rel_goal_sub = self.create_subscription(Float64, self.relative_x_goal_topic, self._on_rel_goal, self.io_queue_depth)
+        self.abs_goal_sub = self.create_subscription(Float64, self.absolute_x_goal_topic, self._on_abs_goal, self.io_queue_depth)
+        self.cmd_pub = self.create_publisher(Twist, self.cmd_topic, self.io_queue_depth)
+        self.nav_cmd_pub = self.create_publisher(NavCommander, self.nav_command_topic, self.io_queue_depth)
+        self.nav_status_pub = self.create_publisher(NavStatus, self.nav_status_topic, self.io_queue_depth)
 
-        self.srv_align = self.create_service(Trigger, '/line_drive/align_to_line', self._srv_align)
-        self.srv_nudge = self.create_service(Trigger, '/line_drive/nudge_forward', self._srv_nudge)
-        self.srv_align_y_only = self.create_service(Trigger, '/line_drive/align_y_only', self._srv_align_y_only)
+        self.srv_align = self.create_service(Trigger, self.srv_align_name, self._srv_align)
+        self.srv_nudge = self.create_service(Trigger, self.srv_nudge_name, self._srv_nudge)
+        self.srv_align_y_only = self.create_service(Trigger, self.srv_align_y_only_name, self._srv_align_y_only)
 
         # NEW: manual forward/backward subscribers (Bool)
-        self.fwd_sub = self.create_subscription(Bool, '/line_drive/go_forward', self._on_go_forward, 10)
-        self.back_sub = self.create_subscription(Bool, '/line_drive/go_backward', self._on_go_backward, 10)
+        self.fwd_sub = self.create_subscription(Bool, self.go_forward_topic, self._on_go_forward, self.io_queue_depth)
+        self.back_sub = self.create_subscription(Bool, self.go_backward_topic, self._on_go_backward, self.io_queue_depth)
 
     # ---------------- 상태 변수 ----------------
         self.phase = Phase.IDLE
@@ -266,7 +348,7 @@ class LineDriveNode(Node):
 
     # 마이크로 컨트롤러 전역 변수 
         self._micro_last_time = self.get_clock().now()
-        self._micro_interval = 1.0  # 20 ms
+        self._micro_interval = self.micro_interval_sec
         self._microcon_active = False
         self._microcon_delta_x = 0.0
         self._microcon_delta_y = 0.0
@@ -291,11 +373,10 @@ class LineDriveNode(Node):
         if command == NavCommander.CMD_START:
             self.get_logger().info(f'Nav_Commander Received: CMD_START, Mode: {msg.mode}, Target_Point: {msg.target_point}, Target_Points: {msg.target_points}, Poses: {len(msg.poses)}')
             if msg.mode == NavCommander.MODE_GOTO:
-                if msg.target_point == 0:
-                    self.goal_abs_x = 10.58
-                elif msg.target_point == 1:
-                    self.goal_abs_x = 13.58
-                elif msg.target_point == 2:
+                # target_point별 목표 x는 파라미터 리스트로 관리 (하드코딩 제거)
+                if 0 <= msg.target_point < len(self.goto_target_abs_x_list):
+                    self.goal_abs_x = float(self.goto_target_abs_x_list[msg.target_point])
+                else:
                     self.goal_abs_x = None
                 if self.goal_abs_x is not None:
                     self.goal_rel_dx = None
@@ -450,8 +531,8 @@ class LineDriveNode(Node):
         """DONE 단계: 0 속도 명령 발행 및 목표 비활성화."""
         delx= self.x - self._microcon_target_x
         dely= self.y
-        if abs(delx)<= 0.006 and abs(dely)<= 0.006:
-            if self.yaw<= 0.05 and self.yaw>= -0.05:
+        if abs(delx) <= self.tol_xy and abs(dely) <= self.tol_xy:
+            if abs(self.yaw) <= self.tol_yaw:
                 self.get_logger().info(f"[Done] micro control finished. Final error: Δx={delx:.4f} m, Δy={dely:.4f} m")
                 self.phase = Phase.DONE
                 self.goal_active = False
@@ -512,7 +593,7 @@ class LineDriveNode(Node):
 
             spd = math.hypot(vx_cmd, vy_cmd)
             if spd > self.max_v:
-                scale = self.max_v / max(spd, 1e-6)
+                scale = self.max_v / max(spd, self._eps)
                 vx_cmd *= scale
                 vy_cmd *= scale
 
@@ -572,7 +653,7 @@ class LineDriveNode(Node):
     # (A3) Grace 기간: 제어 차단 (수동 포함) + 주기적 남은 시간 로그
         if self.resume_block_until is not None and now < self.resume_block_until:
             # 주기적으로 남은 시간 로그 (0.25s 간격)
-            if self._last_grace_log_time is None or (now - self._last_grace_log_time) > Duration(seconds=0.25):
+            if self._last_grace_log_time is None or (now - self._last_grace_log_time) > Duration(seconds=self.grace_log_period):
                 remaining = (self.resume_block_until - now).nanoseconds / 1e9
                 self.get_logger().info(f"[safety] grace active: {remaining:.2f}s remaining")
                 self._last_grace_log_time = now
@@ -583,7 +664,7 @@ class LineDriveNode(Node):
         if self.resume_block_until is not None and now >= self.resume_block_until:
             self.resume_block_until = None
             if self.goal_abs_x is not None or self.goal_rel_dx is not None:
-                if abs(self.goal_abs_x - self.x) < 1.0:
+                if self.goal_abs_x is not None and abs(self.goal_abs_x - self.x) < self.resume_cancel_goal_distance:
                     nav_cmd_msg = NavCommander()
                     nav_cmd_msg.reqid = self.req_id
                     nav_cmd_msg.seqid = self.seq_id
@@ -778,7 +859,7 @@ class LineDriveNode(Node):
 
             spd = math.hypot(vx_cmd, vy_cmd)
             if spd > self.max_v:
-                scale = self.max_v / max(spd, 1e-6)
+                scale = self.max_v / max(spd, self._eps)
                 vx_cmd *= scale
                 vy_cmd *= scale
 
@@ -840,7 +921,7 @@ class LineDriveNode(Node):
             return forward_err
 
         # 후보 2: reverse (±π same sign as yaw)
-        target_rev = math.copysign(math.pi, yaw_meas if yaw_meas != 0 else 1.0)
+        target_rev = math.copysign(math.pi, yaw_meas if yaw_meas != 0 else self._copysign_fallback)
         err_rev = ang_norm(yaw_meas - target_rev)
 
         return err_rev if abs(err_rev) < abs(forward_err) else forward_err
@@ -858,33 +939,34 @@ class LineDriveNode(Node):
             self._microcon_target_x = x_target
             self._micro_last_time= self.get_clock().now()
             self._microcon_delta_x = x_target - self.x
-            if self._microcon_delta_x>0.03:
-                self._microcon_delta_x=0.03
-            if self._microcon_delta_x<-0.03:
-                self._microcon_delta_x=-0.03
+            if self._microcon_delta_x > self.micro_max_delta_xy:
+                self._microcon_delta_x = self.micro_max_delta_xy
+            if self._microcon_delta_x < -self.micro_max_delta_xy:
+                self._microcon_delta_x = -self.micro_max_delta_xy
             self._microcon_delta_y = 0.0 - self.y
-            if self._microcon_delta_y>0.03:
-                self._microcon_delta_y=0.03
-            if self._microcon_delta_y<-0.03:
-                self._microcon_delta_y=-0.03
+            if self._microcon_delta_y > self.micro_max_delta_xy:
+                self._microcon_delta_y = self.micro_max_delta_xy
+            if self._microcon_delta_y < -self.micro_max_delta_xy:
+                self._microcon_delta_y = -self.micro_max_delta_xy
             self._microcon_delta_yaw = 0.0 - self.yaw
             self._microcon_active = True
         
         time_phase_delta = (self.get_clock().now() - self._micro_last_time).nanoseconds / 1e9 
         time_phase=time_phase_delta / self._micro_interval
 
-        if time_phase <0.3: # 가속 구간
+        if time_phase < self.micro_xy_t_accel_end: # 가속 구간
             # 에러 벡터 기반 3차 보간 -> 속도 지령 계산 -> 출력
-            vx_cmd = self._microcon_delta_x / math.hypot(self._microcon_delta_x, self._microcon_delta_y) *0.0001
-            vy_cmd = self._microcon_delta_y / math.hypot(self._microcon_delta_x, self._microcon_delta_y) *0.0001
+            norm = max(math.hypot(self._microcon_delta_x, self._microcon_delta_y), self._eps)
+            vx_cmd = (self._microcon_delta_x / norm) * self.micro_xy_initial_speed
+            vy_cmd = (self._microcon_delta_y / norm) * self.micro_xy_initial_speed
             self._publish_twist(vx_cmd, vy_cmd, 0)
-        elif time_phase <1.3: # 가속 구간
+        elif time_phase < self.micro_xy_t_profile_end: # 가속 구간
             # 에러 벡터 기반 3차 보간 -> 속도 지령 계산 -> 출력
-            vx_cmd = cubic_interpolation(0.0, self._microcon_delta_x, time_phase, 0.3, 1.3)[1]
-            vy_cmd = cubic_interpolation(0.0, self._microcon_delta_y, time_phase, 0.3, 1.3)[1]
+            vx_cmd = cubic_interpolation(0.0, self._microcon_delta_x, time_phase, self.micro_xy_t_accel_end, self.micro_xy_t_profile_end)[1]
+            vy_cmd = cubic_interpolation(0.0, self._microcon_delta_y, time_phase, self.micro_xy_t_accel_end, self.micro_xy_t_profile_end)[1]
             self._publish_twist(vx_cmd, vy_cmd, 0)
 
-        elif time_phase >=1.3 and time_phase <1.6: # 정지 위치 안정화
+        elif time_phase >= self.micro_xy_t_profile_end and time_phase < self.micro_xy_t_settle_end: # 정지 위치 안정화
             vx_cmd = 0.0
             vy_cmd = 0.0
             self._publish_twist(vx_cmd, vy_cmd, 0)
@@ -894,8 +976,8 @@ class LineDriveNode(Node):
             delx= self.x - self._microcon_target_x
             dely= self.y
             self.get_logger().info(f"[micro_xy_align] micro control finished. Final error: Δx={delx:.4f} m, Δy={dely:.4f} m")
-            if abs(delx)<= 0.006 and abs(dely)<= 0.006:
-                if self.yaw<= 0.05 and self.yaw>= -0.05:
+            if abs(delx) <= self.tol_xy and abs(dely) <= self.tol_xy:
+                if abs(self.yaw) <= self.tol_yaw:
                     self.get_logger().info(f"[micro_xy_align] final yaw within tolerance Δyaw={self.yaw:.4f}, entering DONE.")
                     self._enter_done()
                     return
@@ -912,34 +994,34 @@ class LineDriveNode(Node):
         if not self._microcon_active:
             self._micro_last_time= self.get_clock().now()
             self._microcon_delta_yaw = self.yaw
-            if self._microcon_delta_yaw>0.3:
-                self._microcon_delta_yaw=0.3
-            if self._microcon_delta_yaw<-0.3:
-                self._microcon_delta_yaw=-0.3
+            if self._microcon_delta_yaw > self.micro_yaw_max_delta:
+                self._microcon_delta_yaw = self.micro_yaw_max_delta
+            if self._microcon_delta_yaw < -self.micro_yaw_max_delta:
+                self._microcon_delta_yaw = -self.micro_yaw_max_delta
             self._microcon_active = True
         
         time_phase_delta = (self.get_clock().now() - self._micro_last_time).nanoseconds / 1e9 
         time_phase=time_phase_delta / self._micro_interval
-        if time_phase <0.3: # 가속 구간 
+        if time_phase < self.micro_yaw_t_accel_end: # 가속 구간 
             # 정지 
             wz_cmd = 0.0 
             vx_cmd = 0.0 
             # 센서 점을 기준으로 회전하게 하기 위한 보정 
             self._publish_twist(vx_cmd, 0.0, wz_cmd) 
-        elif time_phase <1.0: # 가속 구간 
+        elif time_phase < self.micro_yaw_t_profile_end: # 가속 구간 
             # 에러 벡터 기반 3차 보간 -> 속도 지령 계산 -> 출력 
-            w_cmd = cubic_interpolation(0.0, self._microcon_delta_yaw, time_phase, 0.3, 1.0)[1] 
-            x_cmd = w_cmd*0.51 # 센서 점을 기준으로 회전하게 하기 위한 보정 v=ω*r
+            w_cmd = cubic_interpolation(0.0, self._microcon_delta_yaw, time_phase, self.micro_yaw_t_accel_end, self.micro_yaw_t_profile_end)[1] 
+            x_cmd = w_cmd * self.micro_yaw_rotation_radius # 센서 점을 기준으로 회전하게 하기 위한 보정 v=ω*r
             # self.get_logger().info(f"[micro_yaw_align] time_phase={time_phase:.3f}, wz_cmd={w_cmd:.6f} rad/s, x_cmd={x_cmd:.6f} m/s")
             self._publish_twist(x_cmd, 0.0, w_cmd)
 
-        elif time_phase >=1.0 and time_phase <1.3: # 정지 위치 안정화
+        elif time_phase >= self.micro_yaw_t_profile_end and time_phase < self.micro_yaw_t_settle_end: # 정지 위치 안정화
             self._publish_twist(0.0, 0.0, 0.0)
 
         else: # 종료
             self._microcon_active = False
             self.get_logger().info(f"[micro_yaw_align] micro control finished. Final error: Δyaw={self.yaw:.2f} rad")
-            if abs(self.yaw) <= 0.05:
+            if abs(self.yaw) <= self.tol_yaw:
                 self._enter_micro_xy()
                 return
             else:
@@ -971,7 +1053,8 @@ def cubic_interpolation(x0,x1,tc,ts,te):
     """
     if tc<ts: tc=ts
     if tc>te: tc=te
-    if te-ts<0.1: te=ts+0.1
+    if te-ts < CUBIC_MIN_DURATION_SEC:
+        te = ts + CUBIC_MIN_DURATION_SEC
     t=(tc-ts)/(te-ts)
     return x0+(x1-x0)*t*t*(3-2*t) , (x1-x0)*t*(6-6*t) 
 
